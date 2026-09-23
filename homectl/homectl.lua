@@ -26,8 +26,8 @@ end
 local function generateClient()
   local tmpClientFile = "client_gen.lua"
 
-  shell.run("wget https://raw.githubusercontent.com/40476/cctweaked-programs/main/homectl/config_gen.lua config_gen.lua")
-  shell.run("wget https://raw.githubusercontent.com/40476/cctweaked-programs/main/homectl/client_base.lua client_base.lua")
+  shell.run("wget https://raw.githubusercontent.com/usr40k/cctweaked-programs/main/homectl/config_gen.lua config_gen.lua")
+  shell.run("wget https://raw.githubusercontent.com/usr40k/cctweaked-programs/main/homectl/client_base.lua client_base.lua")
 
   shell.run("config_gen.lua")
 
