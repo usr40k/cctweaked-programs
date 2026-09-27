@@ -20,7 +20,7 @@ local wiredModemSide = "%s"
 ]], listenChannel, password, wirelessModemSide, wiredModemSide)
 
   -- Gateway server base code
-  shell.run("wget https://raw.githubusercontent.com/40476/cctweaked-programs/main/homectl/gateway_server_base.lua gateway_server_base.lua")
+  shell.run("wget https://raw.githubusercontent.com/usr40k/cctweaked-programs/main/homectl/gateway_server_base.lua gateway_server_base.lua")
   local f2 = fs.open("gateway_server_base.lua", "r")
   serverBase = f2.readAll()
   f2.close()
@@ -68,7 +68,7 @@ local monitorName = %s
 
   local monitorCode = ""
   if monitorName then
-    shell.run("wget https://raw.githubusercontent.com/40476/cctweaked-programs/main/homectl/door.lua door.lua")
+    shell.run("wget https://raw.githubusercontent.com/usr40k/cctweaked-programs/main/homectl/door.lua door.lua")
     local f2 = fs.open("door.lua", "r")
     monitorCode = f2.readAll()
     f2.close()
