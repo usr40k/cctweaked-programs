@@ -5,42 +5,32 @@
     - Base Station (runHost):  owns the authoritative relay list, drives
       redstone output, evaluates automations, and is the source of truth
       that every pocket client syncs from.
-    - Pocket Client (runClient): a thin, always-reconnecting remote for
-      viewing/controlling relays. It never edits its own relay list
-      directly - every change is sent to the base as a command, and the
-      base's reply ("sync") is what actually updates what the client sees.
+    - Pocket Client (runClient): a thin, always-reconnecting remote. It never
+      edits its own relay list directly - every change is sent to the base
+      as a command, and the base's "sync" reply is what updates the client.
 
-  Key bindings (host & pocket client, unless noted):
-    Up/Down        Move selection
-    Enter / Space  Toggle selected relay
-    A              Add a new relay                 (opens a form)
-    E              Edit selected relay              (opens a form)
-    T              Edit selected relay's automations (opens a form)
-    P              Pause/unpause selected relay (or clear a manual override)
-    D              Delete selected relay
-    N              Pin/unpin selected relay (pinned relays float to the top)
-    ,  .           Move selected relay up / down within its pinned group
-    V              Quick-toggle list style: compact <-> detailed
-    C              Open display Settings (text size, list style, color scheme,
-                   and - on the base - monitor scale)
-    S              (Base only) Cycle attached monitor's text scale
+  Networks: each base and its clients share a *named network*. The name is
+  hashed to a modem channel, so several independent hubs can coexist
+  without hearing each other. Press W to rename/switch networks.
 
-  Forms (A / E / T / C) are mouse-and-keyboard GUIs: click a field to focus
-  and edit it, Tab/Up/Down to move between fields, Enter/Space to
-  edit/toggle/cycle a field, click [Save]/[Cancel] or press S/Esc.
+  Press H at any time for the full shortcut list (the footer is kept short
+  on purpose so it never runs off small screens).
+
+  Forms (A / E / T / C / W) are mouse-and-keyboard GUIs: click a field or
+  Tab/Up/Down to it, Enter/Space/click to edit, toggle or cycle it, and
+  click [Save]/[Cancel] or press S/Esc. Each value sits under its label so
+  it works on confined screens, and long text scrolls to follow the cursor.
 ]]
 
-local PORT = 4242
-local CONFIG_FILE = "relays.json"        -- Base station: relay list + shared settings
-local CLIENT_STATE_FILE = "relay_client.json" -- Pocket client: this client's own uuid + prefs
+local CONFIG_FILE = "relays.json"             -- Base: relay list + shared settings
+local CLIENT_STATE_FILE = "relay_client.json" -- Pocket: this client's uuid + prefs
 local isPocket = (pocket ~= nil)
 
-local GPS_STALE_AFTER = 10   -- seconds without a fresh GPS fix before we call it stale/lost
-local BASE_UNREACHABLE_AFTER = 12 -- seconds without a sync before we warn the client
+local GPS_STALE_AFTER = 10          -- seconds without a GPS fix before it's "stale"
+local BASE_UNREACHABLE_AFTER = 12   -- seconds without a sync before warning
+local MARQUEE_INTERVAL = 0.6        -- seconds between sideways-scroll steps
 
--- Bind Wireless/Ender Modem
 local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
-if modem then modem.open(PORT) end
 
 -- Shared runtime state
 local relays = {}
@@ -52,17 +42,24 @@ local SCALES = { 0.5, 1.0, 1.5, 2.0 }
 local lastPlayerPos = nil
 local lastGPSFixTime = nil
 local activePulses = {}      -- [timerId] = { id = relayId, targetState = bool }
-local sensorState = {}       -- [relayId] = { lastInput = bool, armedUntil = clockSeconds }  (not persisted)
+local sensorState = {}       -- [relayId] = { lastInput, armedUntil } (not persisted)
+local marqueePhase = 0
 
--- Display/client preferences (shared vocabulary between base & pocket client)
-local uiStyle = "compact"       -- "compact" | "detailed"
+-- Network identity
+local networkName = "default"
+local knownNetworks = { "default" }
+local currentChannel = nil
+
+-- Display preferences
+local uiStyle = "compact"       -- "compact" | "detailed" | "spacious"
 local colorScheme = "default"   -- "default" | "dark" | "mono" | "highcontrast"
-local textSize = 1.0            -- pocket client's own terminal text scale
+local overflowMode = "truncate" -- "truncate" | "scroll" | "wrap"
+local textSize = 1.0            -- pocket terminal text scale
 
--- Host-only: settings the base remembers per connected client uuid
+-- Host-only: settings remembered per client uuid
 local baseClientSettings = {}
 
--- Client-only: this device's identity + connection tracking
+-- Client-only: identity + connection tracking
 local clientId = nil
 local lastSyncTime = nil
 local hasEverSynced = false
@@ -134,7 +131,7 @@ local function palette()
 end
 
 -- ===========================================================================
--- Identity
+-- Identity & Networks
 -- ===========================================================================
 
 local function generateUUID()
@@ -144,6 +141,37 @@ local function generateUUID()
         local v = (c == "x") and math.random(0, 15) or math.random(8, 11)
         return string.format("%x", v)
     end))
+end
+
+-- Deterministic name -> modem channel (1..65000)
+local function nameToChannel(name)
+    local h = 0
+    for i = 1, #name do
+        h = (h * 31 + string.byte(name, i)) % 65536
+    end
+    return (h % 65000) + 1
+end
+
+-- (Re)tunes this device's modem to the channel for `name`.
+local function tuneToNetwork(name)
+    networkName = name
+    local known = false
+    for _, n in ipairs(knownNetworks) do
+        if n == name then known = true; break end
+    end
+    if not known then table.insert(knownNetworks, name) end
+
+    if modem then
+        if currentChannel then pcall(modem.close, currentChannel) end
+        currentChannel = nameToChannel(name)
+        modem.open(currentChannel)
+    end
+end
+
+local function send(msg)
+    if modem and currentChannel then
+        modem.transmit(currentChannel, currentChannel, msg)
+    end
 end
 
 -- ===========================================================================
@@ -172,6 +200,9 @@ local function saveConfig()
         scale = monitorScale,
         uiStyle = uiStyle,
         colorScheme = colorScheme,
+        overflowMode = overflowMode,
+        network = networkName,
+        knownNetworks = knownNetworks,
         clients = baseClientSettings,
     }))
     f.close()
@@ -187,6 +218,9 @@ local function loadConfig()
             monitorScale = data.scale or monitorScale
             uiStyle = data.uiStyle or uiStyle
             colorScheme = data.colorScheme or colorScheme
+            overflowMode = data.overflowMode or overflowMode
+            networkName = data.network or networkName
+            knownNetworks = data.knownNetworks or knownNetworks
             baseClientSettings = data.clients or {}
             nextRelayId = data.nextId or 1
         elseif type(data) == "table" then
@@ -218,7 +252,10 @@ local function saveClientState()
         uuid = clientId,
         uiStyle = uiStyle,
         colorScheme = colorScheme,
+        overflowMode = overflowMode,
         textSize = textSize,
+        network = networkName,
+        knownNetworks = knownNetworks,
         cachedRelays = relays,
     }))
     f.close()
@@ -232,7 +269,10 @@ local function loadClientState()
         clientId = data.uuid
         uiStyle = data.uiStyle or uiStyle
         colorScheme = data.colorScheme or colorScheme
+        overflowMode = data.overflowMode or overflowMode
         textSize = data.textSize or textSize
+        networkName = data.network or networkName
+        knownNetworks = data.knownNetworks or knownNetworks
         if data.cachedRelays then relays = data.cachedRelays end
     end
     if not clientId then
@@ -241,24 +281,21 @@ local function loadClientState()
     end
 end
 
+local function clientSettingsPayload()
+    return { uiStyle = uiStyle, colorScheme = colorScheme, overflowMode = overflowMode, textSize = textSize }
+end
+
 local function persistSettings()
     if isPocket then
         saveClientState()
-        if modem then
-            modem.transmit(PORT, PORT, {
-                cmd = "setClientConfig",
-                clientId = clientId,
-                data = { uiStyle = uiStyle, colorScheme = colorScheme, textSize = textSize },
-            })
-        end
+        send({ cmd = "setClientConfig", clientId = clientId, data = clientSettingsPayload() })
     else
         saveConfig()
     end
 end
 
 -- ===========================================================================
--- Relay list helpers (id-based, so reordering/pinning never desyncs
--- selection or network commands the way array-index based lookups would)
+-- Relay list helpers (id-based so reorder/pin never desyncs selection)
 -- ===========================================================================
 
 local function findRelayById(id)
@@ -275,7 +312,7 @@ local function findRelayIndexById(id)
     return nil
 end
 
--- Pinned relays float to the top; relative order is preserved within each group.
+-- Pinned relays float to the top; order is preserved within each group.
 local function buildDisplayList()
     local pinned, rest = {}, {}
     for _, r in ipairs(relays) do
@@ -292,8 +329,7 @@ local function togglePin(id)
     if r then r.pinned = not r.pinned end
 end
 
--- Moves a relay up/down relative to the nearest other relay with the same
--- pinned state, so pinned and unpinned relays each keep their own order.
+-- Swaps with the nearest neighbour that has the same pinned state.
 local function moveRelay(id, direction)
     local idx = findRelayIndexById(id)
     if not idx then return end
@@ -318,13 +354,9 @@ local function moveSelection(dir)
     selectedRelayId = list[pos].id
 end
 
--- ===========================================================================
--- Networking
--- ===========================================================================
-
 local function broadcastSync()
-    if modem and not isPocket then
-        modem.transmit(PORT, PORT, { cmd = "sync", data = relays })
+    if not isPocket then
+        send({ cmd = "sync", data = relays })
     end
 end
 
@@ -357,14 +389,11 @@ local function evaluateAutomations()
             -- 2. Redstone Level Trigger
             if r.autoRedstone and r.autoRedstone.enabled then
                 hasActiveTrigger = true
-                local inSide = r.autoRedstone.side or "left"
-                autoTargetState = redstone.getInput(inSide)
+                autoTargetState = redstone.getInput(r.autoRedstone.side or "left")
             end
 
-            -- 3. Motion Sensor Trigger (edge-triggered, e.g. a sculk sensor
-            --    wired through a comparator into a redstone input). A single
-            --    pulse "arms" the relay on for holdSeconds; a fresh pulse
-            --    during that window re-arms/extends it.
+            -- 3. Motion Sensor Trigger (edge-triggered: a pulse arms the relay
+            --    for holdSeconds; a fresh pulse re-arms/extends it)
             if r.autoSensor and r.autoSensor.enabled then
                 hasActiveTrigger = true
                 local side = r.autoSensor.side or "back"
@@ -397,7 +426,6 @@ local function evaluateAutomations()
                 if r.autoGPS.targetY ~= nil then
                     inY = math.abs(lastPlayerPos.y - r.autoGPS.targetY) <= yMax
                 end
-
                 autoTargetState = (inRadius and inY)
             end
 
@@ -436,7 +464,7 @@ local function cycleMonitorScale()
     saveConfig()
 end
 
--- Dynamic GPS Polling Rate: poll fast near an armed GPS trigger, slow elsewhere
+-- Poll GPS fast near an armed trigger, slowly elsewhere
 local function getDynamicGPSInterval(currentX, currentY, currentZ)
     if not currentX or not currentZ then return 2.0 end
 
@@ -446,15 +474,12 @@ local function getDynamicGPSInterval(currentX, currentY, currentZ)
             local dx = currentX - (r.autoGPS.x or 0)
             local dz = currentZ - (r.autoGPS.z or 0)
             local dist2D = math.sqrt(dx * dx + dz * dz)
-            local triggerRadius = r.autoGPS.radius or 10
-
-            local distToEdge = math.max(0, dist2D - triggerRadius)
+            local distToEdge = math.max(0, dist2D - (r.autoGPS.radius or 10))
             if distToEdge < minDist then minDist = distToEdge end
         end
     end
 
     if minDist == math.huge then return 2.0 end
-
     if minDist <= 5 then
         return 0.1
     elseif minDist >= 50 then
@@ -465,7 +490,7 @@ local function getDynamicGPSInterval(currentX, currentY, currentZ)
 end
 
 -- ===========================================================================
--- List rendering helpers
+-- List rendering
 -- ===========================================================================
 
 local function relayBadge(r)
@@ -495,21 +520,22 @@ local function relayDetailLine(r)
 end
 
 -- Renders the relay list to `target` (term or a monitor).
--- activeSelectedId: relay id to highlight, or nil to just mirror (no highlight/no autoscroll)
--- banner: optional { text = "...", level = "warn" } shown under the header
--- emptyMessage: optional override for the "no relays" message
--- Returns: rowMap (screen-row -> relay id) and the (possibly clamped/autoscrolled) offset
+-- activeSelectedId: relay id to highlight, or nil to just mirror (no highlight/autoscroll)
+-- banner: optional { text=, level= } bar under the header
+-- emptyMessage: optional override for the "no relays" text
+-- Returns rowMap (screen row -> relay id) and the clamped/autoscrolled offset.
 local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     local pal = palette()
     local w, h = target.getSize()
     setColors(target, pal.fg, pal.bg)
     target.clear()
 
-    -- Header Bar
+    -- Header
     setColors(target, pal.headerFg, pal.headerBg)
     target.setCursorPos(1, 1)
     local titleLeft = isPocket and "HUB (POCKET)" or string.format("HUB (BASE %.1fx)", monitorScale)
     if w < 28 then titleLeft = "HUB" end
+    if w >= 46 then titleLeft = titleLeft .. " [" .. networkName .. "]" end
 
     local gpsTag, gpsFg
     if lastPlayerPos and lastGPSFixTime and (os.clock() - lastGPSFixTime) < GPS_STALE_AFTER then
@@ -529,13 +555,23 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     local bannerLines = 0
     if banner then
         bannerLines = 1
-        local bg = (banner.level == "warn") and colors.red or colors.yellow
-        setColors(target, colors.white, bg)
+        setColors(target, colors.white, (banner.level == "warn") and colors.red or colors.yellow)
         target.setCursorPos(1, 2)
         target.write((" " .. banner.text .. string.rep(" ", w)):sub(1, w))
     end
 
-    local rowsPerItem = (uiStyle == "detailed") and 2 or 1
+    -- Rows per item depends on style (wrap only matters for compact)
+    local rowsPerItem
+    if uiStyle == "spacious" then
+        rowsPerItem = 3
+    elseif uiStyle == "detailed" then
+        rowsPerItem = 2
+    elseif overflowMode == "wrap" then
+        rowsPerItem = 2
+    else
+        rowsPerItem = 1
+    end
+
     local contentStartY = 2 + bannerLines
     local availableRows = math.max(0, h - contentStartY)
     local viewH = math.max(1, math.floor(availableRows / rowsPerItem))
@@ -543,8 +579,8 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     local list = buildDisplayList()
     local totalItems = #list
 
-    local selPos = nil
     if activeSelectedId then
+        local selPos = nil
         for i, r in ipairs(list) do
             if r.id == activeSelectedId then selPos = i; break end
         end
@@ -564,7 +600,7 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
         if not emptyMessage then
             setColors(target, colors.lightGray, pal.bg)
             target.setCursorPos(2, contentStartY + 3)
-            target.write("Press [A] to setup relays.")
+            target.write("Press [A] to add a relay.")
         end
     else
         for i = 1, viewH do
@@ -576,57 +612,118 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
 
             local isSelected = (activeSelectedId == r.id)
             local bg = isSelected and pal.selBg or pal.bg
-            rowMap[lineY] = r.id
-            if rowsPerItem == 2 then rowMap[lineY + 1] = r.id end
-
-            setColors(target, pal.fg, bg)
-            target.setCursorPos(1, lineY)
-            target.write(string.rep(" ", w - 1))
-
-            -- Status icon column
-            target.setCursorPos(1, lineY)
-            local hasTrig = (relayBadge(r) ~= "")
-            if r.paused then
-                setColors(target, colors.yellow, bg); target.write("P")
-            elseif r.override then
-                setColors(target, colors.orange, bg); target.write("!")
-            elseif hasTrig then
-                setColors(target, colors.cyan, bg); target.write("A")
-            else
-                target.write(" ")
-            end
-
-            -- State button
-            target.setCursorPos(2, lineY)
-            if r.state then
-                setColors(target, colors.white, pal.onBg); target.write(" ON ")
-            else
-                setColors(target, colors.white, pal.offBg); target.write(" OFF ")
+            for rr = 0, rowsPerItem - 1 do
+                if lineY + rr <= h - 1 then rowMap[lineY + rr] = r.id end
             end
 
             local pinMark = r.pinned and "*" or ""
             local badge = relayBadge(r)
             local badgeStr = (badge ~= "") and (" [" .. badge .. "]") or ""
+            local nameFg = isSelected and pal.selFg or pal.fg
 
-            setColors(target, isSelected and pal.selFg or pal.fg, bg)
-            target.setCursorPos(7, lineY)
-            local label = string.format("%d.%s%s%s", itemPos, pinMark, r.name or "Relay", badgeStr)
-            if w > 36 and rowsPerItem == 1 then
-                label = label .. string.format(" (%s:%s)", r.relayName or "relay", r.side or "top")
-            end
-            target.write(label:sub(1, math.max(1, w - 8)))
-
-            if rowsPerItem == 2 and lineY + 1 <= h - 1 then
-                setColors(target, colors.lightGray, bg)
-                target.setCursorPos(1, lineY + 1)
+            local function clearRow(y)
+                setColors(target, pal.fg, bg)
+                target.setCursorPos(1, y)
                 target.write(string.rep(" ", w - 1))
-                target.setCursorPos(7, lineY + 1)
-                target.write(relayDetailLine(r):sub(1, math.max(1, w - 8)))
+            end
+
+            local function drawStatusAndState(y)
+                target.setCursorPos(1, y)
+                if r.paused then
+                    setColors(target, colors.yellow, bg); target.write("P")
+                elseif r.override then
+                    setColors(target, colors.orange, bg); target.write("!")
+                elseif badge ~= "" then
+                    setColors(target, colors.cyan, bg); target.write("A")
+                else
+                    setColors(target, pal.fg, bg); target.write(" ")
+                end
+                target.setCursorPos(2, y)
+                if r.state then
+                    setColors(target, colors.white, pal.onBg); target.write(" ON ")
+                else
+                    setColors(target, colors.white, pal.offBg); target.write(" OFF ")
+                end
+            end
+
+            if uiStyle == "spacious" then
+                -- Row 1: name on its own line
+                clearRow(lineY)
+                setColors(target, nameFg, bg)
+                target.setCursorPos(2, lineY)
+                target.write(string.format("%d.%s%s", itemPos, pinMark, r.name or "Relay"):sub(1, math.max(1, w - 2)))
+                -- Row 2: state + badges
+                if lineY + 1 <= h - 1 then
+                    clearRow(lineY + 1)
+                    drawStatusAndState(lineY + 1)
+                    if badge ~= "" then
+                        setColors(target, pal.fg, bg)
+                        target.setCursorPos(8, lineY + 1)
+                        target.write(("[" .. badge .. "]"):sub(1, math.max(1, w - 8)))
+                    end
+                end
+                -- Row 3: peripheral + trigger summary
+                if lineY + 2 <= h - 1 then
+                    clearRow(lineY + 2)
+                    setColors(target, colors.lightGray, bg)
+                    target.setCursorPos(2, lineY + 2)
+                    target.write(relayDetailLine(r):sub(1, math.max(1, w - 2)))
+                end
+            elseif uiStyle == "detailed" then
+                clearRow(lineY)
+                drawStatusAndState(lineY)
+                setColors(target, nameFg, bg)
+                target.setCursorPos(7, lineY)
+                target.write(string.format("%d.%s%s%s", itemPos, pinMark, r.name or "Relay", badgeStr):sub(1, math.max(1, w - 8)))
+                if lineY + 1 <= h - 1 then
+                    clearRow(lineY + 1)
+                    setColors(target, colors.lightGray, bg)
+                    target.setCursorPos(7, lineY + 1)
+                    target.write(relayDetailLine(r):sub(1, math.max(1, w - 8)))
+                end
+            elseif rowsPerItem == 2 then
+                -- Compact + wrap: an overlong label continues on a second line
+                clearRow(lineY)
+                drawStatusAndState(lineY)
+                setColors(target, nameFg, bg)
+                local fullLabel = string.format("%d.%s%s%s", itemPos, pinMark, r.name or "Relay", badgeStr)
+                local avail = math.max(1, w - 8)
+                target.setCursorPos(7, lineY)
+                target.write(fullLabel:sub(1, avail))
+                if lineY + 1 <= h - 1 then
+                    clearRow(lineY + 1)
+                    if #fullLabel > avail then
+                        setColors(target, nameFg, bg)
+                        target.setCursorPos(7, lineY + 1)
+                        target.write(fullLabel:sub(avail + 1, avail * 2))
+                    end
+                end
+            else
+                -- Plain compact: truncate, or scroll sideways when overlong
+                clearRow(lineY)
+                drawStatusAndState(lineY)
+                setColors(target, nameFg, bg)
+                local fullLabel = string.format("%d.%s%s%s", itemPos, pinMark, r.name or "Relay", badgeStr)
+                if w > 36 then
+                    fullLabel = fullLabel .. string.format(" (%s:%s)", r.relayName or "relay", r.side or "top")
+                end
+                local avail = math.max(1, w - 8)
+                local shown
+                if overflowMode == "scroll" and #fullLabel > avail then
+                    local maxScroll = #fullLabel - avail
+                    local pos = marqueePhase % (maxScroll + 4) -- brief pause at each end
+                    local startIdx = math.min(maxScroll, pos) + 1
+                    shown = fullLabel:sub(startIdx, startIdx + avail - 1)
+                else
+                    shown = fullLabel:sub(1, avail)
+                end
+                target.setCursorPos(7, lineY)
+                target.write(shown)
             end
         end
     end
 
-    -- Right Scrollbar
+    -- Right scrollbar
     local sidebarX = w
     setColors(target, colors.black, colors.yellow)
     target.setCursorPos(sidebarX, contentStartY); target.write("^")
@@ -649,39 +746,17 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     setColors(target, colors.black, colors.yellow)
     target.setCursorPos(sidebarX, h - 1); target.write("v")
 
-    -- Footer Bar
+    -- Footer: intentionally short - [H] shows every shortcut
     setColors(target, pal.footerFg, pal.footerBg)
     target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
-    if w < 30 then
-        setColors(target, colors.white, colors.blue); target.write("A"); setColors(target, pal.footerFg, pal.footerBg); target.write("+ ")
-        setColors(target, colors.white, colors.purple); target.write("T"); setColors(target, pal.footerFg, pal.footerBg); target.write("r ")
-        setColors(target, colors.white, colors.yellow); target.write("P"); setColors(target, pal.footerFg, pal.footerBg); target.write("s ")
-        setColors(target, colors.white, colors.red); target.write("D"); setColors(target, pal.footerFg, pal.footerBg); target.write("l ")
-        setColors(target, colors.white, colors.magenta); target.write("N"); setColors(target, pal.footerFg, pal.footerBg); target.write("p")
-    else
-        setColors(target, colors.white, colors.blue); target.write(" [A]dd ")
-        setColors(target, colors.white, colors.blue); target.write(" [E]dit ")
-        setColors(target, colors.white, colors.purple); target.write(" [T]rig ")
-        setColors(target, colors.white, colors.yellow); target.write(" [P]ause ")
-        setColors(target, colors.white, colors.red); target.write(" [D]el ")
-        setColors(target, colors.white, colors.magenta); target.write(" [N]pin ")
-        if w > 66 then
-            setColors(target, colors.white, colors.green); target.write(" ,/. Move ")
-            setColors(target, colors.white, colors.cyan); target.write(" [V]iew ")
-            setColors(target, colors.white, colors.orange); target.write(" [C]fg ")
-            if not isPocket then
-                setColors(target, colors.white, colors.gray); target.write(" [S]cale ")
-            end
-        end
-        setColors(target, pal.footerFg, pal.footerBg); target.write(" [Enter]Toggle")
-    end
+    target.write((" [Enter] Toggle   [H] Shortcuts"):sub(1, w))
 
     setColors(target, pal.fg, pal.bg)
     return rowMap, offset
 end
 
 -- ===========================================================================
--- Generic mouse/keyboard navigable form (replaces all read()-based prompts)
+-- Generic form engine: label above value, row-based scrolling, mouse + keys
 -- ===========================================================================
 
 local function cycleChoice(field, state, dir)
@@ -695,14 +770,9 @@ local function cycleChoice(field, state, dir)
     state[field.key] = choices[idx]
 end
 
-local function drawFormField(target, x, y, w, field, state, focused, labelW)
+-- Draws just the value box (the label lives on the row above it)
+local function drawFormValueRow(target, x, y, w, field, state, focused)
     local pal = palette()
-    setColors(target, pal.fg, pal.bg)
-    target.setCursorPos(x, y)
-    target.write(field.label:sub(1, labelW))
-
-    local valueX = x + labelW
-    local valueW = math.max(4, (x + w) - valueX)
     local raw
     if field.type == "bool" then
         raw = state[field.key] and "[X] Yes" or "[ ] No"
@@ -710,27 +780,35 @@ local function drawFormField(target, x, y, w, field, state, focused, labelW)
         raw = "< " .. tostring(state[field.key]) .. " >"
     else
         raw = tostring(state[field.key] or "")
+        -- Not editing: show the tail so the most recent text is visible
+        if #raw > w - 1 then raw = "<" .. raw:sub(#raw - (w - 3)) end
     end
-
     setColors(target, focused and pal.fieldFocusFg or pal.fieldFg, focused and pal.fieldFocusBg or pal.fieldBg)
-    target.setCursorPos(valueX, y)
+    target.setCursorPos(x, y)
     local text = " " .. raw
-    if #text < valueW then text = text .. string.rep(" ", valueW - #text) end
-    target.write(text:sub(1, valueW))
+    if #text < w then text = text .. string.rep(" ", w - #text) end
+    target.write(text:sub(1, w))
 end
 
-local function editTextField(target, x, y, w, field, state, labelW)
+-- Single-line text input. Redraws on every keystroke and scrolls sideways so
+-- the cursor (always at the end of the text) stays in view.
+local function editTextField(target, x, y, w, field, state)
     local pal = palette()
     local original = state[field.key]
     local buf = tostring(original or "")
     state[field.key] = buf
     while true do
-        drawFormField(target, x, y, w, field, state, true, labelW)
-        local cx = x + labelW + 1 + #buf
-        if cx <= x + w then
-            setColors(target, pal.fieldFocusFg, pal.fieldFocusBg)
-            target.setCursorPos(cx, y); target.write("_")
+        local visibleW = math.max(1, w - 2) -- room for scroll marker + cursor
+        local shown, scrolled = buf, false
+        if #shown > visibleW then
+            shown = shown:sub(#shown - visibleW + 1)
+            scrolled = true
         end
+        setColors(target, pal.fieldFocusFg, pal.fieldFocusBg)
+        target.setCursorPos(x, y)
+        local line = (scrolled and "<" or " ") .. shown .. "_"
+        if #line < w then line = line .. string.rep(" ", w - #line) end
+        target.write(line:sub(1, w))
 
         local ev, p1 = os.pullEvent()
         if ev == "char" then
@@ -746,11 +824,11 @@ local function editTextField(target, x, y, w, field, state, labelW)
                     if n == nil then
                         setColors(target, colors.red, pal.bg)
                         target.setCursorPos(x, y + 1)
-                        target.write("Please enter a valid number")
+                        target.write(("Please enter a valid number"):sub(1, w))
                         sleep(0.9)
                         setColors(target, pal.bg, pal.bg)
                         target.setCursorPos(x, y + 1)
-                        target.write(string.rep(" ", 30))
+                        target.write(string.rep(" ", w))
                     else
                         state[field.key] = n
                         return
@@ -775,13 +853,24 @@ local function getVisibleFields(fields, state)
     return out
 end
 
+-- Sections take 1 row; every other field takes 2 (label row + value row)
+local function layoutFormRows(visible)
+    local rowStart, rowSpan = {}, {}
+    local total = 0
+    for i, f in ipairs(visible) do
+        rowStart[i] = total
+        rowSpan[i] = (f.type == "section") and 1 or 2
+        total = total + rowSpan[i]
+    end
+    return rowStart, rowSpan, total
+end
+
 -- Returns true if saved, false if cancelled. Mutates `state` in place.
 local function runForm(target, title, fields, state)
     local w, h = target.getSize()
-    local labelW = math.max(8, math.min(22, math.floor((w - 2) * 0.5)))
-    local fieldsAreaH = math.max(1, h - 4)
+    local fieldsAreaH = math.max(2, h - 4)
     local focusIdx = 1
-    local formScroll = 0
+    local rowOffset = 0
 
     local function isSelectable(i, visible)
         return visible[i] and visible[i].type ~= "section"
@@ -798,9 +887,13 @@ local function runForm(target, title, fields, state)
             focusIdx = j
         end
 
-        if focusIdx - formScroll < 1 then formScroll = focusIdx - 1 end
-        if focusIdx - formScroll > fieldsAreaH then formScroll = focusIdx - fieldsAreaH end
-        formScroll = math.max(0, math.min(formScroll, math.max(0, #visible - fieldsAreaH)))
+        -- Keep the focused field fully in view
+        local rowStart, rowSpan, totalRows = layoutFormRows(visible)
+        local fS = rowStart[focusIdx]
+        local fE = fS + rowSpan[focusIdx] - 1
+        if fS < rowOffset then rowOffset = fS end
+        if fE > rowOffset + fieldsAreaH - 1 then rowOffset = fE - fieldsAreaH + 1 end
+        rowOffset = math.max(0, math.min(rowOffset, math.max(0, totalRows - fieldsAreaH)))
 
         local pal = palette()
         setColors(target, pal.fg, pal.bg)
@@ -809,20 +902,31 @@ local function runForm(target, title, fields, state)
         target.setCursorPos(1, 1)
         target.write((" " .. title .. string.rep(" ", w)):sub(1, w))
 
-        local rowOf = {}
-        local yOf = {}
+        local rowOf, yOf = {}, {}
         for i, f in ipairs(visible) do
-            local row = i - formScroll
-            if row >= 1 and row <= fieldsAreaH then
-                local y = 2 + row
-                yOf[i] = y
+            local s = rowStart[i]
+            local e = s + rowSpan[i] - 1
+            if e >= rowOffset and s <= rowOffset + fieldsAreaH - 1 then
                 if f.type == "section" then
+                    local y = 2 + (s - rowOffset)
                     setColors(target, pal.accentFg, pal.bg)
                     target.setCursorPos(2, y)
                     target.write(f.label:sub(1, w - 2))
-                else
                     rowOf[y] = i
-                    drawFormField(target, 2, y, w - 2, f, state, (i == focusIdx), labelW)
+                else
+                    local labelY = 2 + (s - rowOffset)
+                    local valueY = labelY + 1
+                    if labelY >= 2 and labelY <= 1 + fieldsAreaH then
+                        setColors(target, pal.fg, pal.bg)
+                        target.setCursorPos(2, labelY)
+                        target.write(f.label:sub(1, w - 2))
+                        rowOf[labelY] = i
+                    end
+                    if valueY >= 2 and valueY <= 1 + fieldsAreaH then
+                        drawFormValueRow(target, 4, valueY, w - 4, f, state, (i == focusIdx))
+                        rowOf[valueY] = i
+                        yOf[i] = valueY
+                    end
                 end
             end
         end
@@ -835,7 +939,7 @@ local function runForm(target, title, fields, state)
 
         setColors(target, pal.footerFg, pal.footerBg)
         target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
-        target.write(" [Tab]Next [Enter]Edit [S]ave [Esc]Cancel")
+        target.write((" [Tab]Next [Enter]Edit [S]ave [Esc]Cancel"):sub(1, w))
 
         local ev, p1, p2, p3 = os.pullEvent()
         local field = visible[focusIdx]
@@ -846,11 +950,11 @@ local function runForm(target, title, fields, state)
             elseif p1 == keys.up then
                 local j = focusIdx
                 repeat j = math.max(1, j - 1) until j == 1 or isSelectable(j, visible)
-                focusIdx = j
+                if isSelectable(j, visible) then focusIdx = j end
             elseif p1 == keys.down then
                 local j = focusIdx
                 repeat j = math.min(#visible, j + 1) until j == #visible or isSelectable(j, visible)
-                focusIdx = j
+                if isSelectable(j, visible) then focusIdx = j end
             elseif p1 == keys.left and field and field.type == "choice" then
                 cycleChoice(field, state, -1)
             elseif p1 == keys.right and field and field.type == "choice" then
@@ -860,8 +964,8 @@ local function runForm(target, title, fields, state)
                     state[field.key] = not state[field.key]
                 elseif field.type == "choice" then
                     cycleChoice(field, state, 1)
-                elseif field.type == "text" or field.type == "number" then
-                    editTextField(target, 2, yOf[focusIdx], w - 2, field, state, labelW)
+                elseif (field.type == "text" or field.type == "number") and yOf[focusIdx] then
+                    editTextField(target, 4, yOf[focusIdx], w - 4, field, state)
                 end
             elseif p1 == keys.s then
                 return true
@@ -874,15 +978,15 @@ local function runForm(target, title, fields, state)
                 if p2 >= 13 and p2 <= 22 then return false end
             else
                 local idx = rowOf[p3]
-                if idx then
+                if idx and visible[idx].type ~= "section" then
                     focusIdx = idx
                     local f = visible[idx]
                     if f.type == "bool" then
                         state[f.key] = not state[f.key]
                     elseif f.type == "choice" then
                         cycleChoice(f, state, (p1 == 2) and -1 or 1)
-                    elseif f.type == "text" or f.type == "number" then
-                        editTextField(target, 2, p3, w - 2, f, state, labelW)
+                    elseif (f.type == "text" or f.type == "number") and yOf[idx] then
+                        editTextField(target, 4, yOf[idx], w - 4, f, state)
                     end
                 end
             end
@@ -896,8 +1000,7 @@ end
 
 local SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
--- Returns a plain {name=,relayName=,side=,mode=} table if saved, or nil if cancelled.
--- `defaults` supplies pre-fill values (an existing relay, or {} for a new one).
+-- Returns {name, relayName, side, mode} if saved, nil if cancelled.
 local function editRelayForm(defaults)
     local state = {
         name = defaults.name or ("Relay " .. (#relays + 1)),
@@ -915,7 +1018,7 @@ local function editRelayForm(defaults)
     return { name = state.name, relayName = state.relayName, side = state.side, mode = state.mode }
 end
 
--- Returns a {autoTime=,autoRedstone=,autoSensor=,autoGPS=} table if saved, or nil if cancelled.
+-- Returns {autoTime, autoRedstone, autoSensor, autoGPS} if saved, nil if cancelled.
 local function editTriggersForm(r)
     local defX, defY, defZ = 0, 64, 0
     if isPocket then
@@ -971,7 +1074,7 @@ local function editTriggersForm(r)
         { key = "gpsMaxYDiff", label = "Max Y Diff:", type = "number", visible = function(s) return s.gpsEnabled and s.gpsUseY end },
     }
 
-    if not runForm(term, "AUTOMATION TRIGGERS (" .. (r.name or "Relay") .. ")", fields, state) then return nil end
+    if not runForm(term, "TRIGGERS: " .. (r.name or "Relay"), fields, state) then return nil end
 
     local triggers = {
         autoTime = { enabled = state.timeEnabled, startHour = tonumber(state.startHour) or 6.0, endHour = tonumber(state.endHour) or 18.0 },
@@ -982,29 +1085,30 @@ local function editTriggersForm(r)
     if state.gpsUseY then
         triggers.autoGPS.targetY = tonumber(state.gpsY) or 64
         triggers.autoGPS.maxYDiff = tonumber(state.gpsMaxYDiff) or 1.5
-    else
-        triggers.autoGPS.targetY = nil
     end
     return triggers
 end
 
--- Mutates the shared display-preference globals in place. Returns true if saved.
+-- Updates the display-preference globals in place. Returns true if saved.
 local function editSettingsForm()
     local state = {
         textSize = tostring(textSize),
         uiStyle = uiStyle,
+        overflowMode = overflowMode,
         colorScheme = colorScheme,
         monitorScale = tostring(monitorScale),
     }
     local fields = {
         { key = "textSize", label = "Text Size:", type = "choice", choices = { "0.5", "1.0", "1.5", "2.0" }, visible = function() return isPocket end },
-        { key = "uiStyle", label = "List Style:", type = "choice", choices = { "compact", "detailed" } },
+        { key = "uiStyle", label = "List Style:", type = "choice", choices = { "compact", "detailed", "spacious" } },
+        { key = "overflowMode", label = "Long Names (compact):", type = "choice", choices = { "truncate", "scroll", "wrap" } },
         { key = "colorScheme", label = "Color Scheme:", type = "choice", choices = { "default", "dark", "mono", "highcontrast" } },
         { key = "monitorScale", label = "Monitor Scale:", type = "choice", choices = { "0.5", "1.0", "1.5", "2.0" }, visible = function() return not isPocket end },
     }
     if not runForm(term, "DISPLAY SETTINGS", fields, state) then return false end
 
     uiStyle = state.uiStyle
+    overflowMode = state.overflowMode
     colorScheme = state.colorScheme
     if isPocket then
         textSize = tonumber(state.textSize) or textSize
@@ -1015,8 +1119,105 @@ local function editSettingsForm()
     return true
 end
 
+-- Switch to (or create) a named network. Returns true if the network changed.
+local function editNetworkForm()
+    local choices = {}
+    for _, n in ipairs(knownNetworks) do table.insert(choices, n) end
+    if #choices == 0 then choices = { networkName } end
+
+    local state = { network = networkName, newNetwork = "" }
+    local fields = {
+        { key = "network", label = "Active Network:", type = "choice", choices = choices },
+        { key = "newNetwork", label = "Or create/join a new one:", type = "text" },
+    }
+    if not runForm(term, "NETWORK SETTINGS", fields, state) then return false end
+
+    local target = (state.newNetwork ~= "" and state.newNetwork) or state.network
+    if not target or target == "" or target == networkName then return false end
+
+    tuneToNetwork(target)
+    if isPocket then
+        -- Old relay data belonged to the previous network
+        relays = {}
+        selectedRelayId = nil
+        hasEverSynced = false
+        lastSyncTime = nil
+    end
+    return true
+end
+
 -- ===========================================================================
--- Host: relay mutation helpers (shared by local keypresses & network commands)
+-- Shortcuts screen
+-- ===========================================================================
+
+local HELP_ITEMS = {
+    { "Up / Down", "Move selection" },
+    { "Enter/Space", "Toggle selected relay" },
+    { "A", "Add a new relay" },
+    { "E", "Edit selected relay" },
+    { "T", "Edit its automation triggers" },
+    { "P", "Pause / clear manual override" },
+    { "D", "Delete selected relay" },
+    { "N", "Pin / unpin (pinned go to top)" },
+    { ", and .", "Move relay up / down" },
+    { "V", "Cycle list style" },
+    { "C", "Display settings" },
+    { "W", "Network name / switch network" },
+    { "S", "Monitor scale (base only)" },
+    { "H", "Show this screen" },
+    { "Mouse", "Click a row to toggle it" },
+    { "Forms", "Tab/arrows move, Enter edits," },
+    { "", "S saves, Esc cancels" },
+}
+
+local function showHelpScreen(target)
+    local w, h = target.getSize()
+    local scroll = 0
+    local viewH = math.max(1, h - 2)
+    local keyW = math.min(13, math.floor(w / 2))
+
+    while true do
+        local pal = palette()
+        setColors(target, pal.fg, pal.bg)
+        target.clear()
+        setColors(target, pal.headerFg, pal.headerBg)
+        target.setCursorPos(1, 1)
+        target.write((" SHORTCUTS  (network: " .. networkName .. ")" .. string.rep(" ", w)):sub(1, w))
+
+        for i = 1, viewH do
+            local item = HELP_ITEMS[i + scroll]
+            if not item then break end
+            setColors(target, pal.accentFg, pal.bg)
+            target.setCursorPos(2, i + 1)
+            target.write(item[1]:sub(1, keyW))
+            setColors(target, pal.fg, pal.bg)
+            target.setCursorPos(2 + keyW + 1, i + 1)
+            target.write(item[2]:sub(1, math.max(1, w - keyW - 2)))
+        end
+
+        setColors(target, pal.footerFg, pal.footerBg)
+        target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
+        target.write((" [Up/Down] Scroll  [Enter/Esc/H] Close"):sub(1, w))
+
+        local ev, p1 = os.pullEvent()
+        if ev == "key" then
+            if p1 == keys.up then
+                scroll = math.max(0, scroll - 1)
+            elseif p1 == keys.down then
+                scroll = math.min(math.max(0, #HELP_ITEMS - viewH), scroll + 1)
+            elseif p1 == keys.enter or p1 == keys.escape or p1 == keys.h then
+                return
+            end
+        elseif ev == "mouse_scroll" then
+            scroll = math.max(0, math.min(math.max(0, #HELP_ITEMS - viewH), scroll + p1))
+        elseif ev == "mouse_click" then
+            return
+        end
+    end
+end
+
+-- ===========================================================================
+-- Host: relay mutation helpers (shared by local keys & network commands)
 -- ===========================================================================
 
 local function commit()
@@ -1107,7 +1308,9 @@ end
 
 local function runHost()
     loadConfig()
+    tuneToNetwork(networkName)
     local clockTimer = os.startTimer(1.0)
+    local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
 
     while true do
         local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset)
@@ -1126,6 +1329,9 @@ local function runHost()
             if p1 == clockTimer then
                 evaluateAutomations()
                 clockTimer = os.startTimer(1.0)
+            elseif p1 == marqueeTimer then
+                marqueePhase = marqueePhase + 1
+                marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
             elseif activePulses[p1] then
                 local info = activePulses[p1]
                 local r = findRelayById(info.id)
@@ -1174,10 +1380,16 @@ local function runHost()
             elseif p1 == keys.period and selectedRelayId then
                 hostMoveRelay(selectedRelayId, 1)
             elseif p1 == keys.v then
-                uiStyle = (uiStyle == "compact") and "detailed" or "compact"
+                if uiStyle == "compact" then uiStyle = "detailed"
+                elseif uiStyle == "detailed" then uiStyle = "spacious"
+                else uiStyle = "compact" end
                 persistSettings()
             elseif p1 == keys.c then
                 if editSettingsForm() then persistSettings() end
+            elseif p1 == keys.w then
+                if editNetworkForm() then saveConfig() end
+            elseif p1 == keys.h then
+                showHelpScreen(term)
             elseif p1 == keys.s then
                 cycleMonitorScale()
             end
@@ -1224,9 +1436,7 @@ local function runHost()
                 evaluateAutomations()
             elseif msg.cmd == "hello" and msg.clientId then
                 if baseClientSettings[msg.clientId] then
-                    if modem then
-                        modem.transmit(PORT, PORT, { cmd = "clientConfig", clientId = msg.clientId, data = baseClientSettings[msg.clientId] })
-                    end
+                    send({ cmd = "clientConfig", clientId = msg.clientId, data = baseClientSettings[msg.clientId] })
                 elseif msg.settings then
                     baseClientSettings[msg.clientId] = msg.settings
                     saveConfig()
@@ -1241,14 +1451,14 @@ local function runHost()
 end
 
 -- ===========================================================================
--- Pocket Client Engine (parallel UI & GPS threads so GPS polling never
--- steals keyboard/mouse events from the UI, and vice versa)
+-- Pocket Client Engine (UI and GPS run in parallel threads)
 -- ===========================================================================
 
 local function applyReceivedClientConfig(data)
     if not data then return end
     if data.uiStyle then uiStyle = data.uiStyle end
     if data.colorScheme then colorScheme = data.colorScheme end
+    if data.overflowMode then overflowMode = data.overflowMode end
     if data.textSize then
         textSize = data.textSize
         if term.setTextScale then pcall(term.setTextScale, textSize) end
@@ -1258,78 +1468,92 @@ end
 
 local function clientBanner()
     if not hasEverSynced then
-        return { text = "Connecting to base station...", level = "warn" }
+        return { text = "Connecting to '" .. networkName .. "'...", level = "warn" }
     end
     if not lastSyncTime or (os.clock() - lastSyncTime) > BASE_UNREACHABLE_AFTER then
         local secs = lastSyncTime and math.floor(os.clock() - lastSyncTime) or 0
-        return { text = string.format("BASE STATION UNREACHABLE (last synced %ds ago)", secs), level = "warn" }
+        return { text = string.format("BASE UNREACHABLE (last sync %ds ago)", secs), level = "warn" }
     end
     return nil
 end
 
+local function clientSayHello()
+    send({ cmd = "hello", clientId = clientId, settings = clientSettingsPayload() })
+    send({ cmd = "get" })
+end
+
 local function runClient()
     loadClientState()
+    tuneToNetwork(networkName)
     if term.setTextScale then pcall(term.setTextScale, textSize) end
-
-    if modem then
-        modem.transmit(PORT, PORT, {
-            cmd = "hello", clientId = clientId,
-            settings = { uiStyle = uiStyle, colorScheme = colorScheme, textSize = textSize },
-        })
-        modem.transmit(PORT, PORT, { cmd = "get" })
-    end
+    clientSayHello()
 
     local function clientUIThread()
         local heartbeatTimer = os.startTimer(5.0)
+        local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
 
         while true do
             local banner = clientBanner()
-            local emptyMsg = (not hasEverSynced) and "Waiting for relay data from base station..." or nil
+            local emptyMsg = (not hasEverSynced) and "Waiting for base station..." or nil
             local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset, banner, emptyMsg)
             scrollOffset = newOffset
 
             local ev, p1, p2, p3, msg = os.pullEvent()
 
-            if ev == "timer" and p1 == heartbeatTimer then
-                if modem then modem.transmit(PORT, PORT, { cmd = "get" }) end
-                heartbeatTimer = os.startTimer(5.0)
+            if ev == "timer" then
+                if p1 == heartbeatTimer then
+                    send({ cmd = "get" })
+                    heartbeatTimer = os.startTimer(5.0)
+                elseif p1 == marqueeTimer then
+                    marqueePhase = marqueePhase + 1
+                    marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
+                end
             elseif ev == "key" then
                 if p1 == keys.up then
                     moveSelection(-1)
                 elseif p1 == keys.down then
                     moveSelection(1)
                 elseif (p1 == keys.enter or p1 == keys.space) and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "toggle", id = selectedRelayId }) end
+                    send({ cmd = "toggle", id = selectedRelayId })
                 elseif p1 == keys.a then
                     local fields = editRelayForm({})
-                    if fields and modem then modem.transmit(PORT, PORT, { cmd = "addRelay", data = fields }) end
+                    if fields then send({ cmd = "addRelay", data = fields }) end
                 elseif p1 == keys.e and selectedRelayId then
                     local r = findRelayById(selectedRelayId)
                     if r then
                         local fields = editRelayForm(r)
-                        if fields and modem then modem.transmit(PORT, PORT, { cmd = "editRelay", id = selectedRelayId, data = fields }) end
+                        if fields then send({ cmd = "editRelay", id = selectedRelayId, data = fields }) end
                     end
                 elseif p1 == keys.t and selectedRelayId then
                     local r = findRelayById(selectedRelayId)
                     if r then
                         local triggers = editTriggersForm(r)
-                        if triggers and modem then modem.transmit(PORT, PORT, { cmd = "editTriggers", id = selectedRelayId, data = triggers }) end
+                        if triggers then send({ cmd = "editTriggers", id = selectedRelayId, data = triggers }) end
                     end
                 elseif p1 == keys.p and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "setPaused", id = selectedRelayId }) end
+                    send({ cmd = "setPaused", id = selectedRelayId })
                 elseif p1 == keys.d and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "deleteRelay", id = selectedRelayId }) end
+                    send({ cmd = "deleteRelay", id = selectedRelayId })
                 elseif p1 == keys.n and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "setPinned", id = selectedRelayId }) end
+                    send({ cmd = "setPinned", id = selectedRelayId })
                 elseif p1 == keys.comma and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "moveRelay", id = selectedRelayId, dir = -1 }) end
+                    send({ cmd = "moveRelay", id = selectedRelayId, dir = -1 })
                 elseif p1 == keys.period and selectedRelayId then
-                    if modem then modem.transmit(PORT, PORT, { cmd = "moveRelay", id = selectedRelayId, dir = 1 }) end
+                    send({ cmd = "moveRelay", id = selectedRelayId, dir = 1 })
                 elseif p1 == keys.v then
-                    uiStyle = (uiStyle == "compact") and "detailed" or "compact"
+                    if uiStyle == "compact" then uiStyle = "detailed"
+                    elseif uiStyle == "detailed" then uiStyle = "spacious"
+                    else uiStyle = "compact" end
                     persistSettings()
                 elseif p1 == keys.c then
                     if editSettingsForm() then persistSettings() end
+                elseif p1 == keys.w then
+                    if editNetworkForm() then
+                        saveClientState()
+                        clientSayHello()
+                    end
+                elseif p1 == keys.h then
+                    showHelpScreen(term)
                 end
             elseif ev == "mouse_scroll" then
                 scrollOffset = math.max(0, scrollOffset + p1)
@@ -1343,7 +1567,7 @@ local function runClient()
                     local clickedId = termRowMap[p3]
                     if clickedId then
                         selectedRelayId = clickedId
-                        if modem then modem.transmit(PORT, PORT, { cmd = "toggle", id = clickedId }) end
+                        send({ cmd = "toggle", id = clickedId })
                     end
                 end
             elseif ev == "modem_message" and type(msg) == "table" then
@@ -1370,7 +1594,7 @@ local function runClient()
                 if x then
                     lastPlayerPos = { x = x, y = y, z = z }
                     lastGPSFixTime = os.clock()
-                    if modem then modem.transmit(PORT, PORT, { cmd = "location", x = x, y = y, z = z }) end
+                    send({ cmd = "location", x = x, y = y, z = z })
                     delay = getDynamicGPSInterval(x, y, z)
                 end
                 gpsTimer = os.startTimer(delay)
