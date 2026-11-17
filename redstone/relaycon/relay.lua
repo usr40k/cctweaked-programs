@@ -1164,6 +1164,7 @@ local HELP_ITEMS = {
     { "C", "Display settings" },
     { "W", "Network name / switch network" },
     { "S", "Monitor scale (base only)" },
+    { "Y", "YouCube remote control" },
     { "H", "Show this screen" },
     { "Mouse", "Click a row to toggle it" },
     { "Forms", "Tab/arrows move, Enter edits," },
@@ -1287,6 +1288,27 @@ end
 
 local function hostSetPinned(id)
     togglePin(id)
+    commit()
+end
+
+local function hostSetState(idOrName, state)
+    local r = nil
+    -- Try numeric ID first
+    if type(idOrName) == "number" then
+        r = findRelayById(idOrName)
+    end
+    -- Fall back to matching by relayName (peripheral name)
+    if not r then
+        for _, candidate in ipairs(relays) do
+            if candidate.relayName == tostring(idOrName) then
+                r = candidate
+                break
+            end
+        end
+    end
+    if not r then return end
+    r.override = true
+    r.state = state
     commit()
 end
 
@@ -1445,6 +1467,12 @@ local function runHost()
             elseif msg.cmd == "setClientConfig" and msg.clientId and msg.data then
                 baseClientSettings[msg.clientId] = msg.data
                 saveConfig()
+            elseif msg.cmd == "setState" and msg.id ~= nil and msg.state ~= nil then
+                hostSetState(msg.id, msg.state)
+            elseif msg.cmd == "youcube_remote" then
+                -- YouCube remote commands are pass-through to the youcube client,
+                -- the base just re-transmits them so they reach everyone on the channel.
+                send(msg)
             end
         end
     end
@@ -1480,6 +1508,219 @@ end
 local function clientSayHello()
     send({ cmd = "hello", clientId = clientId, settings = clientSettingsPayload() })
     send({ cmd = "get" })
+end
+
+-- ===========================================================================
+-- YouCube Remote UI helpers (pocket client only)
+-- ===========================================================================
+
+local function sendYouCubeRemote(action, payload)
+    local msg = { cmd = "youcube_remote", action = action }
+    if payload then
+        for k, v in pairs(payload) do msg[k] = v end
+    end
+    send(msg)
+end
+
+-- Simple text input dialog. Returns the entered string or nil if cancelled.
+local function remoteTextInput(title, prompt, default)
+    local w, h = term.getSize()
+    local pal = palette()
+    local buf = tostring(default or "")
+    local cursor = #buf
+
+    while true do
+        setColors(term, pal.fg, pal.bg)
+        term.clear()
+        setColors(term, pal.headerFg, pal.headerBg)
+        term.setCursorPos(1, 1)
+        term.write(( " " .. title .. string.rep(" ", w) ):sub(1, w))
+
+        setColors(term, pal.fg, pal.bg)
+        term.setCursorPos(2, 4)
+        term.write(prompt:sub(1, w - 2))
+
+        local visibleW = math.max(1, w - 4)
+        local shown = buf
+        if #shown > visibleW then shown = shown:sub(#shown - visibleW + 1) end
+        setColors(term, pal.fieldFocusFg, pal.fieldFocusBg)
+        term.setCursorPos(2, 6)
+        term.write(( ">" .. shown .. "_" .. string.rep(" ", w) ):sub(1, w))
+
+        setColors(term, pal.footerFg, pal.footerBg)
+        term.setCursorPos(1, h)
+        term.write(( " [Enter] Send  [Esc] Cancel" .. string.rep(" ", w) ):sub(1, w))
+
+        local ev, p1 = os.pullEvent()
+        if ev == "char" then
+            buf = buf:sub(1, cursor) .. p1 .. buf:sub(cursor + 1)
+            cursor = cursor + 1
+        elseif ev == "key" then
+            if p1 == keys.backspace then
+                if cursor > 0 then
+                    buf = buf:sub(1, cursor - 1) .. buf:sub(cursor + 1)
+                    cursor = cursor - 1
+                end
+            elseif p1 == keys.enter then
+                return buf
+            elseif p1 == keys.escape then
+                return nil
+            elseif p1 == keys.left then
+                cursor = math.max(0, cursor - 1)
+            elseif p1 == keys.right then
+                cursor = math.min(#buf, cursor + 1)
+            end
+        end
+    end
+end
+
+-- YouCube Remote UI screen. Opens a remote control panel for the YouCube client.
+-- Supports both keyboard shortcuts and mouse-clickable buttons.
+local function youcubeRemoteUI()
+    local w, h = term.getSize()
+    local pal = palette()
+    local capture = false
+    local volume = 50
+    local playing = true
+
+    -- Button definitions: { row, x1, x2, label, handler }
+    local btns = {}
+
+    local function addBtn(row, x1, x2, handler)
+        table.insert(btns, { row = row, x1 = x1, x2 = x2, handler = handler })
+    end
+
+    local function draw()
+        setColors(term, pal.fg, pal.bg)
+        term.clear()
+        setColors(term, pal.headerFg, pal.headerBg)
+        term.setCursorPos(1, 1)
+        term.write(( " YOUCUBE REMOTE  [Y] Close" .. string.rep(" ", w) ):sub(1, w))
+
+        -- Capture toggle button (row 3)
+        setColors(term, pal.fg, pal.bg)
+        term.setCursorPos(2, 3)
+        term.write("Capture Input: ")
+        local capBg = capture and colors.green or colors.red
+        local capTxt = capture and " [ON] " or " [OFF]"
+        setColors(term, colors.white, capBg)
+        term.setCursorPos(16, 3)
+        term.write(capTxt)
+        addBtn(3, 16, 16 + #capTxt - 1, function()
+            capture = not capture
+            sendYouCubeRemote("capture_toggle", { captured = capture })
+            draw()
+        end)
+
+        -- Play/Pause button (row 5)
+        term.setCursorPos(2, 5)
+        term.write("Playback: ")
+        local ppBg = playing and colors.red or colors.green
+        local ppTxt = playing and " [Pause] " or " [Play ] "
+        setColors(term, colors.white, ppBg)
+        term.setCursorPos(12, 5)
+        term.write(ppTxt)
+        addBtn(5, 12, 12 + #ppTxt - 1, function()
+            playing = not playing
+            sendYouCubeRemote("play_pause", { playing = playing })
+            draw()
+        end)
+
+        -- Volume bar + Vol-/Vol+ buttons (row 7)
+        setColors(term, pal.fg, pal.bg)
+        term.setCursorPos(2, 7)
+        term.write(string.format("Volume: %d%%  ", volume))
+        local volBarW = math.min(20, w - 20)
+        local filled = math.floor(volume / 100 * volBarW + 0.5)
+        setColors(term, colors.white, colors.gray)
+        term.setCursorPos(18, 7)
+        term.write(string.rep(" ", volBarW))
+        setColors(term, colors.white, colors.lime)
+        term.setCursorPos(18, 7)
+        term.write(string.rep("#", filled))
+
+        local volMinusX = math.min(39, w - 4)
+        local volPlusX = math.min(43, w - 4)
+        if volMinusX > 18 + volBarW + 1 then
+            setColors(term, colors.white, colors.gray)
+            term.setCursorPos(volMinusX, 7)
+            term.write("[-]")
+            addBtn(7, volMinusX, volMinusX + 2, function()
+                volume = math.max(0, volume - 10)
+                sendYouCubeRemote("volume_down", { volume = volume })
+                draw()
+            end)
+        end
+        if volPlusX > volMinusX + 3 and volPlusX <= w - 2 then
+            setColors(term, colors.white, colors.lime)
+            term.setCursorPos(volPlusX, 7)
+            term.write("[+]")
+            addBtn(7, volPlusX, volPlusX + 2, function()
+                volume = math.min(100, volume + 10)
+                sendYouCubeRemote("volume_up", { volume = volume })
+                draw()
+            end)
+        end
+
+        -- Keystroke hint (row 9)
+        setColors(term, pal.fg, pal.bg)
+        term.setCursorPos(2, 9)
+        term.write("Keystroke: type any key")
+
+        -- Footer
+        setColors(term, pal.footerFg, pal.footerBg)
+        term.setCursorPos(1, h)
+        term.write(( " [C] Capture  [P] Play/Pause  [-] Vol-  [=] Vol+  [K] Key  [T] Text  [Esc/Y] Close" .. string.rep(" ", w) ):sub(1, w))
+    end
+
+    draw()
+
+    while true do
+        local ev, p1, p2, p3 = os.pullEvent()
+        if ev == "key" then
+            if p1 == keys.escape or p1 == keys.y then
+                return
+            elseif p1 == keys.c then
+                capture = not capture
+                sendYouCubeRemote("capture_toggle", { captured = capture })
+                draw()
+            elseif p1 == keys.p then
+                playing = not playing
+                sendYouCubeRemote("play_pause", { playing = playing })
+                draw()
+            elseif p1 == keys.minus then
+                volume = math.max(0, volume - 10)
+                sendYouCubeRemote("volume_down", { volume = volume })
+                draw()
+            elseif p1 == keys.equals then
+                volume = math.min(100, volume + 10)
+                sendYouCubeRemote("volume_up", { volume = volume })
+                draw()
+            elseif p1 == keys.k then
+                local keyName = remoteTextInput("Keystroke Injection", "Key name (e.g. space, enter, r, d):", "")
+                if keyName then
+                    sendYouCubeRemote("keystroke", { key = keyName })
+                end
+                draw()
+            elseif p1 == keys.t then
+                local text = remoteTextInput("Send Text", "Text to type:", "")
+                if text then
+                    sendYouCubeRemote("text", { text = text })
+                end
+                draw()
+            end
+        elseif ev == "char" then
+            sendYouCubeRemote("keystroke", { key = p1 })
+            draw()
+        elseif ev == "mouse_click" then
+            for _, b in ipairs(btns) do
+                if p3 == b.row and p2 >= b.x1 and p2 <= b.x2 then
+                    b.handler()
+                    break
+                end
+            end
+        end
+    end
 end
 
 local function runClient()
@@ -1554,6 +1795,8 @@ local function runClient()
                     end
                 elseif p1 == keys.h then
                     showHelpScreen(term)
+                elseif p1 == keys.y then
+                    youcubeRemoteUI()
                 end
             elseif ev == "mouse_scroll" then
                 scrollOffset = math.max(0, scrollOffset + p1)

@@ -1,0 +1,34 @@
+name: Deploy page
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**.lua"
+
+jobs:
+  deploy-page:
+    runs-on: ubuntu-latest
+    steps:
+      #"standard step" where repo needs to be checked-out first
+      - name: Checkout 🛎️
+        uses: actions/checkout@v4
+
+      - name: Install Lua 🧰
+        uses: leafo/gh-actions-lua@v11
+
+      - name: Install Illuaminate 🧰
+        run: |
+          test -d bin || mkdir bin
+          test -f bin/illuaminate || wget -q -Obin/illuaminate https://squiddev.cc/illuaminate/bin/latest/illuaminate-linux-x86_64
+          chmod +x bin/illuaminate
+
+      - name: Generate documentation 📄
+        run: bin/illuaminate doc-gen
+
+      #Using another action that takes generated HTML and pushes it to GH Pages
+      - name: Deploy page 🚀
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: doc
