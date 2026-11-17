@@ -247,6 +247,20 @@ end
 local yc_paused = false
 local yc_captured = false   -- when false, remote keystrokes are ignored
 local yc_volume = args.volume or 1.0
+-- Live status, broadcast so the relaycon remote can show what is really playing
+local yc_state = "idle"        -- "idle" | "playing"
+local yc_currentTitle = ""
+local function yc_broadcastStatus()
+    yc_send({
+        cmd = "youcube_status",
+        title = yc_currentTitle,
+        state = yc_state,
+        paused = yc_paused,
+        volume = math.floor((yc_volume or 1) * 100 + 0.5),
+        captured = yc_captured,
+    })
+end
+
 -- Remote commands can arrive twice (directly from the pocket and again via the
 -- base station's forward), so every command carries a unique `rid` and we
 -- remember the recent ones to drop duplicates.
@@ -265,6 +279,7 @@ end
 
 -- Open wireless modem for relaycon communication
 yc_modem = yc_openWireless()
+yc_broadcastStatus()
 
 -- CraftOS-PC support --
 
@@ -610,15 +625,28 @@ local function play(url)
             if type(msg) == "table" and msg.cmd == "youcube_remote" and not yc_isDuplicate(msg.rid) then
                 local action = msg.action
                 if action == "play_pause" then
-                    yc_paused = not yc_paused
-                    if yc_paused then
+                    local want = msg.paused
+                    if want == nil then want = not yc_paused end
+                    if want == yc_paused then
+                        -- already in the requested state
+                    elseif want then
+                        yc_paused = true
                         os.queueEvent("youcube:pause")
                     else
+                        yc_paused = false
                         os.queueEvent("youcube:resume")
                     end
                 elseif action == "volume_up" then
                     local newVol = math.min(1, (yc_volume or args.volume or 1) + 0.1)
                     yc_setVolume(newVol)
+                elseif action == "volume_set" then
+                    yc_setVolume(math.max(0, math.min(1, (tonumber(msg.volume) or 100) / 100)))
+                elseif action == "skip" then
+                    os.queueEvent("youcube:remote_key", skip_key)
+                elseif action == "restart" then
+                    os.queueEvent("youcube:remote_key", restart_key)
+                elseif action == "status_request" then
+                    -- nothing to do: the status broadcast below answers it
                 elseif action == "volume_down" then
                     local newVol = math.max(0, (yc_volume or args.volume or 1) - 0.1)
                     yc_setVolume(newVol)
@@ -648,11 +676,23 @@ local function play(url)
                         end
                     end
                 end
+                yc_broadcastStatus()
             end
         end
     end
 
+    -- Tell remotes what is playing, every few seconds
+    local function _status_heartbeat()
+        while true do
+            yc_broadcastStatus()
+            sleep(3)
+        end
+    end
+
     local function _play_media()
+        yc_state = "playing"
+        yc_currentTitle = tostring(data.title or "")
+        yc_broadcastStatus()
         os.queueEvent("youcube:playing")
         yc_relayOff()
         parallel.waitForAll(_play_video, _play_audio)
@@ -714,11 +754,14 @@ local function play(url)
         end
     end
 
-    parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler, _remote_listener, _remote_key_handler)
+    parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler, _remote_listener, _remote_key_handler, _status_heartbeat)
 
     -- Always restore relay state when playback ends (even if interrupted by skip/restart)
     yc_relayOn()
     yc_paused = false -- reset pause state for next media item
+    yc_state = "idle"
+    yc_currentTitle = ""
+    yc_broadcastStatus()
 
     if data.playlist_videos then
         return data.playlist_videos
