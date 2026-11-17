@@ -499,6 +499,71 @@ local skip_key = settings.get("youcube.keys.skip") or keys.d
 local restart_key = settings.get("youcube.keys.restart") or keys.r
 local back_key = settings.get("youcube.keys.back") or keys.a
 
+-- Remote commands from the relaycon pocket/base. Works both during playback and
+-- at the "Enter Url" prompt (see yc_idle_listener).
+local function yc_handleRemote(msg)
+    if type(msg) ~= "table" or msg.cmd ~= "youcube_remote" or yc_isDuplicate(msg.rid) then
+        return
+    end
+    local action = msg.action
+    if action == "play_pause" then
+        local want = msg.paused
+        if want == nil then want = not yc_paused end
+        if want == yc_paused then
+            -- already in the requested state
+        elseif want then
+            yc_paused = true
+            os.queueEvent("youcube:pause")
+        else
+            yc_paused = false
+            os.queueEvent("youcube:resume")
+        end
+    elseif action == "volume_up" then
+        yc_setVolume(math.min(1, (yc_volume or args.volume or 1) + 0.1))
+    elseif action == "volume_down" then
+        yc_setVolume(math.max(0, (yc_volume or args.volume or 1) - 0.1))
+    elseif action == "volume_set" then
+        yc_setVolume(math.max(0, math.min(1, (tonumber(msg.volume) or 100) / 100)))
+    elseif action == "skip" then
+        os.queueEvent("youcube:remote_key", skip_key)
+    elseif action == "restart" then
+        os.queueEvent("youcube:remote_key", restart_key)
+    elseif action == "capture_toggle" then
+        yc_captured = msg.captured ~= false
+    elseif action == "keystroke" then
+        -- A real remote keyboard: becomes ordinary char/key events, so it types
+        -- into the URL prompt and triggers the normal hotkeys. Needs capture on.
+        if yc_captured and msg.key then
+            local name = tostring(msg.key)
+            if #name == 1 then
+                os.queueEvent("char", name)
+                local k = keys[name:lower()]
+                if k then os.queueEvent("key", k) end
+            else
+                local k = keys[name]
+                if k then os.queueEvent("key", k) end
+            end
+        end
+    end
+    -- (status_request and everything else fall through to the broadcast)
+    yc_broadcastStatus()
+end
+
+-- Used at the prompt, where no song is playing: keep answering remotes and
+-- keep the status fresh.
+local function yc_idle_listener()
+    local timer = os.startTimer(3)
+    while true do
+        local ev, p1, p2, p3, msg = os.pullEvent()
+        if ev == "modem_message" then
+            yc_handleRemote(msg)
+        elseif ev == "timer" and p1 == timer then
+            yc_broadcastStatus()
+            timer = os.startTimer(3)
+        end
+    end
+end
+
 local function play(url)
     restart = false
     print("Requesting media ...")
@@ -622,62 +687,7 @@ local function play(url)
     local function _remote_listener()
         while true do
             local ev, p1, p2, p3, msg = os.pullEvent("modem_message")
-            if type(msg) == "table" and msg.cmd == "youcube_remote" and not yc_isDuplicate(msg.rid) then
-                local action = msg.action
-                if action == "play_pause" then
-                    local want = msg.paused
-                    if want == nil then want = not yc_paused end
-                    if want == yc_paused then
-                        -- already in the requested state
-                    elseif want then
-                        yc_paused = true
-                        os.queueEvent("youcube:pause")
-                    else
-                        yc_paused = false
-                        os.queueEvent("youcube:resume")
-                    end
-                elseif action == "volume_up" then
-                    local newVol = math.min(1, (yc_volume or args.volume or 1) + 0.1)
-                    yc_setVolume(newVol)
-                elseif action == "volume_set" then
-                    yc_setVolume(math.max(0, math.min(1, (tonumber(msg.volume) or 100) / 100)))
-                elseif action == "skip" then
-                    os.queueEvent("youcube:remote_key", skip_key)
-                elseif action == "restart" then
-                    os.queueEvent("youcube:remote_key", restart_key)
-                elseif action == "status_request" then
-                    -- nothing to do: the status broadcast below answers it
-                elseif action == "volume_down" then
-                    local newVol = math.max(0, (yc_volume or args.volume or 1) - 0.1)
-                    yc_setVolume(newVol)
-                elseif action == "capture_toggle" then
-                    yc_captured = msg.captured ~= false
-                elseif action == "keystroke" then
-                    -- Only inject when capture is enabled; otherwise ignore completely.
-                    if yc_captured then
-                        local keyName = msg.key
-                        if keyName then
-                            local key = keys[keyName]
-                            if not key and #keyName == 1 then
-                                key = keyName:byte()
-                            end
-                            if key then
-                                os.queueEvent("youcube:remote_key", key)
-                            end
-                        end
-                    end
-                elseif action == "text" then
-                    if yc_captured then
-                        local text = msg.text
-                        if text then
-                            for i = 1, #text do
-                                os.queueEvent("youcube:remote_char", text:sub(i, i))
-                            end
-                        end
-                    end
-                end
-                yc_broadcastStatus()
-            end
+            yc_handleRemote(msg)
         end
     end
 
@@ -809,13 +819,15 @@ local function play_playlist(playlist)
 end
 
 local function main()
+    -- Nothing is playing yet, so the relay should be ON (it goes OFF while media plays)
+    yc_relayOn()
     youcubeapi:detect_bestest_server(args.server, args.verbose)
     pcall(update_checker)
 
     if not args.URL then
         print("Enter Url or Search Term:")
         term.setTextColor(colors.lightGray)
-        args.URL = read()
+        parallel.waitForAny(function() args.URL = read() end, yc_idle_listener)
         term.setTextColor(colors.white)
     end
 
