@@ -44,7 +44,6 @@ local lastGPSFixTime = nil
 local activePulses = {}      -- [timerId] = { id = relayId, targetState = bool }
 local sensorState = {}       -- [relayId] = { lastInput, armedUntil } (not persisted)
 local marqueePhase = 0
-local uiBlocked = false      -- set by any blocking screen (forms/help); main loops then restart their timers
 
 -- Network identity
 local networkName = "default"
@@ -520,12 +519,26 @@ local function relayDetailLine(r)
     return table.concat(parts, "  ")
 end
 
+-- Bottom toolbar items: { label, action }. "More" always survives narrow screens.
+local TOOLBAR_FULL = { { "Add", "add" }, { "Edit", "edit" }, { "Trig", "triggers" }, { "More", "menu" } }
+local function buildToolbar(w)
+    local items = {}
+    for _, it in ipairs(TOOLBAR_FULL) do items[#items + 1] = it end
+    local function width()
+        local t = 0
+        for i, it in ipairs(items) do t = t + #it[1] + 2 + (i > 1 and 1 or 0) end
+        return t
+    end
+    while width() > w and #items > 2 do table.remove(items, #items - 1) end
+    return items
+end
+
 -- Renders the relay list to `target` (term or a monitor).
 -- activeSelectedId: relay id to highlight, or nil to just mirror (no highlight/autoscroll)
 -- banner: optional { text=, level= } bar under the header
 -- emptyMessage: optional override for the "no relays" text
 -- Returns rowMap (screen row -> relay id) and the clamped/autoscrolled offset.
-local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
+local function drawUI(target, activeSelectedId, offset, banner, emptyMessage, showToolbar)
     local pal = palette()
     local w, h = target.getSize()
     setColors(target, pal.fg, pal.bg)
@@ -556,7 +569,8 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     local bannerLines = 0
     if banner then
         bannerLines = 1
-        setColors(target, colors.white, (banner.level == "warn") and colors.red or colors.yellow)
+        local isWarn = (banner.level == "warn")
+        setColors(target, isWarn and colors.white or colors.black, isWarn and colors.red or colors.yellow)
         target.setCursorPos(1, 2)
         target.write((" " .. banner.text .. string.rep(" ", w)):sub(1, w))
     end
@@ -747,13 +761,31 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
     setColors(target, colors.black, colors.yellow)
     target.setCursorPos(sidebarX, h - 1); target.write("v")
 
-    -- Footer: intentionally short - [H] shows every shortcut
+    -- Footer: clickable toolbar on the main terminal, a hint on monitors
     setColors(target, pal.footerFg, pal.footerBg)
     target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
-    target.write((" [Enter] Toggle   [H] Shortcuts"):sub(1, w))
+    local hits = {}
+    if showToolbar then
+        local x = 1
+        for i, it in ipairs(buildToolbar(w)) do
+            local label = " " .. it[1] .. " "
+            if x + #label - 1 > w then break end
+            if it[2] == "menu" then
+                setColors(target, pal.selFg, pal.selBg)
+            else
+                setColors(target, pal.headerFg, pal.headerBg)
+            end
+            target.setCursorPos(x, h)
+            target.write(label)
+            hits[#hits + 1] = { x1 = x, x2 = x + #label - 1, action = it[2] }
+            x = x + #label + 1
+        end
+    else
+        target.write((" Tap a row to toggle"):sub(1, w))
+    end
 
     setColors(target, pal.fg, pal.bg)
-    return rowMap, offset
+    return rowMap, offset, hits, contentStartY
 end
 
 -- ===========================================================================
@@ -771,11 +803,14 @@ local UI_EVENTS = {
     term_resize = true,
 }
 
-local function uiPull()
+-- `also` (optional) = set of non-input event names the caller wants returned
+-- (after the background handler has seen them) so it can redraw.
+local function uiPull(also)
     while true do
         local e = table.pack(os.pullEvent())
         if UI_EVENTS[e[1]] then return table.unpack(e, 1, e.n) end
         if backgroundHandler then backgroundHandler(table.unpack(e, 1, e.n)) end
+        if also and also[e[1]] then return table.unpack(e, 1, e.n) end
     end
 end
 
@@ -908,7 +943,6 @@ end
 
 -- Returns true if saved, false if cancelled. Mutates `state` in place.
 local function runForm(target, title, fields, state)
-    uiBlocked = true
     local w, h = target.getSize()
     local fieldsAreaH = math.max(2, h - 4)
     local focusIdx = 1
@@ -1193,28 +1227,32 @@ end
 -- ===========================================================================
 
 local HELP_ITEMS = {
+    { "Tap ON/OFF", "Toggle that relay" },
+    { "Tap a name", "Select it (for Edit etc.)" },
+    { "Bottom bar", "Add / Edit / Trig / More" },
+    { "More (M)", "Pause, pin, move, delete," },
+    { "", "settings, network, YouCube" },
     { "Up / Down", "Move selection" },
     { "Enter/Space", "Toggle selected relay" },
     { "A", "Add a new relay" },
     { "E", "Edit selected relay" },
     { "T", "Edit its automation triggers" },
     { "P", "Pause / clear manual override" },
-    { "D", "Delete selected relay" },
+    { "D", "Delete selected (asks first)" },
     { "N", "Pin / unpin (pinned go to top)" },
     { ", and .", "Move relay up / down" },
     { "V", "Cycle list style" },
     { "C", "Display settings" },
     { "W", "Network name / switch network" },
     { "S", "Monitor scale (base only)" },
-    { "Y", "YouCube remote control" },
+    { "Y", "YouCube remote" },
     { "H", "Show this screen" },
-    { "Mouse", "Click a row to toggle it" },
     { "Forms", "Tab/arrows move, Enter edits," },
-    { "", "S saves, Esc cancels" },
+    { "", "click away saves a field," },
+    { "", "S saves form, Esc cancels" },
 }
 
 local function showHelpScreen(target)
-    uiBlocked = true
     local w, h = target.getSize()
     local scroll = 0
     local viewH = math.max(1, h - 2)
@@ -1368,171 +1406,47 @@ local function hostMoveRelay(id, dir)
 end
 
 -- ===========================================================================
--- Base Station Engine
+-- Shared engine: toasts, relay commands, dialogs, actions
 -- ===========================================================================
 
-local function runHost()
-    loadConfig()
-    tuneToNetwork(networkName)
-    local clockTimer = os.startTimer(1.0)
-    local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
-
-    while true do
-        if uiBlocked then
-            -- A blocking screen ate our timer events while it was open: restart them
-            uiBlocked = false
-            os.cancelTimer(clockTimer); os.cancelTimer(marqueeTimer)
-            clockTimer = os.startTimer(0.1)
-            marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
-        end
-
-        local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset)
-        scrollOffset = newOffset
-
-        local mon = peripheral.find("monitor")
-        local monRowMap = {}
-        if mon then
-            mon.setTextScale(monitorScale)
-            monRowMap = drawUI(mon, nil, scrollOffset)
-        end
-
-        local ev, p1, p2, p3, msg = os.pullEvent()
-
-        if ev == "timer" then
-            if p1 == clockTimer then
-                evaluateAutomations()
-                clockTimer = os.startTimer(1.0)
-            elseif p1 == marqueeTimer then
-                marqueePhase = marqueePhase + 1
-                marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
-            elseif activePulses[p1] then
-                local info = activePulses[p1]
-                local r = findRelayById(info.id)
-                if r then
-                    r.state = info.targetState
-                    commit()
-                end
-                activePulses[p1] = nil
-            end
-        elseif ev == "redstone" then
-            evaluateAutomations()
-        elseif ev == "key" then
-            if p1 == keys.up then
-                moveSelection(-1)
-            elseif p1 == keys.down then
-                moveSelection(1)
-            elseif (p1 == keys.enter or p1 == keys.space) and selectedRelayId then
-                hostToggle(selectedRelayId)
-            elseif p1 == keys.a then
-                local fields = editRelayForm({})
-                if fields then
-                    local newR = hostAddRelay(fields)
-                    selectedRelayId = newR.id
-                end
-            elseif p1 == keys.e and selectedRelayId then
-                local r = findRelayById(selectedRelayId)
-                if r then
-                    local fields = editRelayForm(r)
-                    if fields then hostEditRelay(selectedRelayId, fields) end
-                end
-            elseif p1 == keys.t and selectedRelayId then
-                local r = findRelayById(selectedRelayId)
-                if r then
-                    local triggers = editTriggersForm(r)
-                    if triggers then hostEditTriggers(selectedRelayId, triggers) end
-                end
-            elseif p1 == keys.p and selectedRelayId then
-                hostSetPaused(selectedRelayId)
-            elseif p1 == keys.d and selectedRelayId then
-                hostDeleteRelay(selectedRelayId)
-                selectedRelayId = nil
-            elseif p1 == keys.n and selectedRelayId then
-                hostSetPinned(selectedRelayId)
-            elseif p1 == keys.comma and selectedRelayId then
-                hostMoveRelay(selectedRelayId, -1)
-            elseif p1 == keys.period and selectedRelayId then
-                hostMoveRelay(selectedRelayId, 1)
-            elseif p1 == keys.v then
-                if uiStyle == "compact" then uiStyle = "detailed"
-                elseif uiStyle == "detailed" then uiStyle = "spacious"
-                else uiStyle = "compact" end
-                persistSettings()
-            elseif p1 == keys.c then
-                if editSettingsForm() then persistSettings() end
-            elseif p1 == keys.w then
-                if editNetworkForm() then saveConfig() end
-            elseif p1 == keys.h then
-                showHelpScreen(term)
-            elseif p1 == keys.s then
-                cycleMonitorScale()
-            end
-        elseif ev == "mouse_scroll" then
-            scrollOffset = math.max(0, scrollOffset + p1)
-        elseif ev == "mouse_click" or ev == "monitor_touch" then
-            local targetMap = (ev == "monitor_touch") and monRowMap or termRowMap
-            local targetPeripheral = (ev == "monitor_touch") and mon or term
-            if targetPeripheral then
-                local tw, th = targetPeripheral.getSize()
-                if p2 == tw then
-                    if p3 == 2 then scrollOffset = math.max(0, scrollOffset - 1)
-                    elseif p3 == th - 1 then scrollOffset = scrollOffset + 1 end
-                else
-                    local clickedId = targetMap[p3]
-                    if clickedId then
-                        selectedRelayId = clickedId
-                        hostToggle(clickedId)
-                    end
-                end
-            end
-        elseif ev == "modem_message" and type(msg) == "table" then
-            if msg.cmd == "toggle" and msg.id then
-                hostToggle(msg.id)
-            elseif msg.cmd == "get" then
-                broadcastSync()
-            elseif msg.cmd == "addRelay" and msg.data then
-                hostAddRelay(msg.data)
-            elseif msg.cmd == "editRelay" and msg.id and msg.data then
-                hostEditRelay(msg.id, msg.data)
-            elseif msg.cmd == "editTriggers" and msg.id and msg.data then
-                hostEditTriggers(msg.id, msg.data)
-            elseif msg.cmd == "setPaused" and msg.id then
-                hostSetPaused(msg.id)
-            elseif msg.cmd == "setPinned" and msg.id then
-                hostSetPinned(msg.id)
-            elseif msg.cmd == "deleteRelay" and msg.id then
-                hostDeleteRelay(msg.id)
-            elseif msg.cmd == "moveRelay" and msg.id and msg.dir then
-                hostMoveRelay(msg.id, msg.dir)
-            elseif msg.cmd == "location" then
-                lastPlayerPos = { x = msg.x, y = msg.y, z = msg.z }
-                lastGPSFixTime = os.clock()
-                evaluateAutomations()
-            elseif msg.cmd == "hello" and msg.clientId then
-                if baseClientSettings[msg.clientId] then
-                    send({ cmd = "clientConfig", clientId = msg.clientId, data = baseClientSettings[msg.clientId] })
-                elseif msg.settings then
-                    baseClientSettings[msg.clientId] = msg.settings
-                    saveConfig()
-                end
-                broadcastSync()
-            elseif msg.cmd == "setClientConfig" and msg.clientId and msg.data then
-                baseClientSettings[msg.clientId] = msg.data
-                saveConfig()
-            elseif msg.cmd == "setState" and msg.id ~= nil and msg.state ~= nil then
-                hostSetState(msg.id, msg.state)
-            elseif msg.cmd == "youcube_remote" and not msg.fwd then
-                -- YouCube remote commands are pass-through to the youcube client,
-                -- the base just re-transmits them so they reach everyone on the channel.
-                msg.fwd = true -- forwarded once only; the player drops duplicates by rid
-                send(msg)
-            end
-        end
-    end
+-- Short-lived status line shown in the banner row (pocket and base)
+local toast = nil
+local function setToast(text, level)
+    toast = { text = text, level = level or "info", untilClock = os.clock() + 3 }
+end
+local function currentToast()
+    if toast and os.clock() < toast.untilClock then return toast end
+    toast = nil
+    return nil
 end
 
--- ===========================================================================
--- Pocket Client Engine (UI and GPS run in parallel threads)
--- ===========================================================================
+-- One entry point for every relay command. The base applies it directly; a
+-- pocket just forwards it and waits for the base's "sync". Network commands
+-- arriving at the base go through the very same function.
+local function hostExec(msg)
+    local c = msg.cmd
+    if c == "toggle" and msg.id then hostToggle(msg.id)
+    elseif c == "addRelay" and msg.data then return hostAddRelay(msg.data)
+    elseif c == "editRelay" and msg.id and msg.data then hostEditRelay(msg.id, msg.data)
+    elseif c == "editTriggers" and msg.id and msg.data then hostEditTriggers(msg.id, msg.data)
+    elseif c == "setPaused" and msg.id then hostSetPaused(msg.id)
+    elseif c == "setPinned" and msg.id then hostSetPinned(msg.id)
+    elseif c == "deleteRelay" and msg.id then hostDeleteRelay(msg.id)
+    elseif c == "moveRelay" and msg.id and msg.dir then hostMoveRelay(msg.id, msg.dir)
+    elseif c == "setState" and msg.id ~= nil and msg.state ~= nil then hostSetState(msg.id, msg.state)
+    else return nil end
+    return true
+end
+
+local function sendRelayCmd(msg)
+    if isPocket then
+        send(msg)
+        return true
+    end
+    return hostExec(msg)
+end
+
+-- Pocket-side helpers -------------------------------------------------------
 
 local function applyReceivedClientConfig(data)
     if not data then return end
@@ -1562,16 +1476,28 @@ local function clientSayHello()
     send({ cmd = "get" })
 end
 
--- ===========================================================================
--- YouCube Remote UI helpers (pocket client only)
--- ===========================================================================
+-- YouCube player state, learned from the player's "youcube_status" broadcasts
+-- (received by both base and pocket).
+local ycStatus = nil -- { title, state, paused, volume(0-100), captured, seen }
+local YC_STALE_AFTER = 8
+
+local function noteYouCubeStatus(msg)
+    ycStatus = {
+        title = tostring(msg.title or ""),
+        state = msg.state or "idle",
+        paused = msg.paused and true or false,
+        volume = tonumber(msg.volume) or 100,
+        captured = msg.captured and true or false,
+        seen = os.clock(),
+    }
+end
 
 local remoteSeq = 0
 local function sendYouCubeRemote(action, payload)
     remoteSeq = remoteSeq + 1
     local msg = {
         cmd = "youcube_remote", action = action,
-        rid = tostring(clientId) .. ":" .. tostring(os.epoch and os.epoch("utc") or os.time()) .. ":" .. remoteSeq,
+        rid = tostring(os.getComputerID()) .. ":" .. tostring(os.epoch and os.epoch("utc") or os.time()) .. ":" .. remoteSeq,
     }
     if payload then
         for k, v in pairs(payload) do msg[k] = v end
@@ -1579,208 +1505,560 @@ local function sendYouCubeRemote(action, payload)
     send(msg)
 end
 
--- Simple text input dialog. Returns the entered string or nil if cancelled.
-local function remoteTextInput(title, prompt, default)
-    uiBlocked = true
-    local w, h = term.getSize()
-    local pal = palette()
-    local buf = tostring(default or "")
-    local cursor = #buf
+-- Dialogs -------------------------------------------------------------------
 
+local function wrapText(text, width)
+    local lines, line = {}, ""
+    for word in tostring(text):gmatch("%S+") do
+        if #line + #word + (line == "" and 0 or 1) > width then
+            if line ~= "" then lines[#lines + 1] = line end
+            line = word
+        else
+            line = (line == "") and word or (line .. " " .. word)
+        end
+    end
+    if line ~= "" then lines[#lines + 1] = line end
+    return lines
+end
+
+-- Yes/No question. Returns true on Yes.
+local function confirmDialog(title, text)
+    local w, h = term.getSize()
     while true do
+        local pal = palette()
         setColors(term, pal.fg, pal.bg)
         term.clear()
         setColors(term, pal.headerFg, pal.headerBg)
         term.setCursorPos(1, 1)
-        term.write(( " " .. title .. string.rep(" ", w) ):sub(1, w))
+        term.write((" " .. title .. string.rep(" ", w)):sub(1, w))
 
         setColors(term, pal.fg, pal.bg)
-        term.setCursorPos(2, 4)
-        term.write(prompt:sub(1, w - 2))
-
-        local visibleW = math.max(1, w - 4)
-        local shown = buf
-        if #shown > visibleW then shown = shown:sub(#shown - visibleW + 1) end
-        setColors(term, pal.fieldFocusFg, pal.fieldFocusBg)
-        term.setCursorPos(2, 6)
-        term.write(( ">" .. shown .. "_" .. string.rep(" ", w) ):sub(1, w))
+        local y = 3
+        for _, line in ipairs(wrapText(text, w - 2)) do
+            if y >= h - 3 then break end
+            term.setCursorPos(2, y)
+            term.write(line)
+            y = y + 1
+        end
+        local btnY = math.min(h - 2, y + 1)
+        setColors(term, colors.white, colors.green)
+        term.setCursorPos(2, btnY); term.write("  Yes  ")
+        setColors(term, colors.white, colors.red)
+        term.setCursorPos(11, btnY); term.write("  No  ")
 
         setColors(term, pal.footerFg, pal.footerBg)
-        term.setCursorPos(1, h)
-        term.write(( " [Enter] Send  [Esc] Cancel" .. string.rep(" ", w) ):sub(1, w))
+        term.setCursorPos(1, h); term.write(string.rep(" ", w)); term.setCursorPos(1, h)
+        term.write((" [Y]es  [N]o / Esc"):sub(1, w))
 
-        local ev, p1 = uiPull()
-        if ev == "char" then
-            buf = buf:sub(1, cursor) .. p1 .. buf:sub(cursor + 1)
-            cursor = cursor + 1
-        elseif ev == "key" then
-            if p1 == keys.backspace then
-                if cursor > 0 then
-                    buf = buf:sub(1, cursor - 1) .. buf:sub(cursor + 1)
-                    cursor = cursor - 1
+        local ev, p1, p2, p3 = uiPull()
+        if ev == "key" then
+            if p1 == keys.y or p1 == keys.enter then return true end
+            if p1 == keys.n or p1 == keys.escape then return false end
+        elseif ev == "mouse_click" and p3 == btnY then
+            if p2 >= 2 and p2 <= 8 then return true end
+            if p2 >= 11 and p2 <= 16 then return false end
+        end
+    end
+end
+
+-- Big-target list menu. items = { { label=, action=, enabled= }, ... }
+-- Returns the chosen action, or nil if dismissed.
+local function menuScreen(title, items)
+    local w, h = term.getSize()
+    local rowsPer = 2
+    local viewN = math.max(1, math.floor((h - 2) / rowsPer))
+    local sel, top = 1, 0
+
+    local function pick(i)
+        local it = items[i]
+        if it and it.enabled ~= false then return it.action end
+        return nil
+    end
+
+    while true do
+        if sel - 1 < top then top = sel - 1 end
+        if sel > top + viewN then top = sel - viewN end
+        top = math.max(0, math.min(top, math.max(0, #items - viewN)))
+
+        local pal = palette()
+        setColors(term, pal.fg, pal.bg)
+        term.clear()
+        setColors(term, pal.headerFg, pal.headerBg)
+        term.setCursorPos(1, 1)
+        term.write((" " .. title .. string.rep(" ", w)):sub(1, w))
+
+        for i = 1, viewN do
+            local idx = top + i
+            local it = items[idx]
+            if not it then break end
+            local y = 2 + (i - 1) * rowsPer
+            local enabled = it.enabled ~= false
+            local isSel = (idx == sel)
+            local bg = isSel and pal.selBg or pal.bg
+            local fg = (not enabled) and colors.gray or (isSel and pal.selFg or pal.fg)
+            setColors(term, fg, bg)
+            term.setCursorPos(1, y)
+            term.write((" " .. it.label .. string.rep(" ", w)):sub(1, w - 1))
+        end
+        if #items > viewN then
+            setColors(term, colors.black, colors.yellow)
+            term.setCursorPos(w, 2); term.write("^")
+            term.setCursorPos(w, h - 1); term.write("v")
+        end
+
+        setColors(term, pal.footerFg, pal.footerBg)
+        term.setCursorPos(1, h); term.write(string.rep(" ", w)); term.setCursorPos(1, h)
+        term.write((" [Up/Dn] [Enter] Pick [Esc] Back"):sub(1, w))
+
+        local ev, p1, p2, p3 = uiPull()
+        if ev == "key" then
+            if p1 == keys.up then sel = math.max(1, sel - 1)
+            elseif p1 == keys.down then sel = math.min(#items, sel + 1)
+            elseif p1 == keys.enter or p1 == keys.space then
+                local a = pick(sel)
+                if a then return a end
+            elseif p1 == keys.escape or p1 == keys.m then return nil end
+        elseif ev == "mouse_scroll" then
+            sel = math.max(1, math.min(#items, sel + p1))
+        elseif ev == "mouse_click" then
+            if p3 == 2 and p2 == w and #items > viewN then
+                sel = math.max(1, sel - 1)
+            elseif p3 == h - 1 and p2 == w and #items > viewN then
+                sel = math.min(#items, sel + 1)
+            elseif p3 >= 2 and p3 <= h - 1 then
+                local idx = top + math.floor((p3 - 2) / rowsPer) + 1
+                if items[idx] then
+                    sel = idx
+                    local a = pick(idx)
+                    if a then return a end
                 end
-            elseif p1 == keys.enter then
-                return buf
-            elseif p1 == keys.escape then
-                return nil
-            elseif p1 == keys.left then
-                cursor = math.max(0, cursor - 1)
-            elseif p1 == keys.right then
-                cursor = math.min(#buf, cursor + 1)
             end
         end
     end
 end
 
--- YouCube Remote UI screen. Opens a remote control panel for the YouCube client.
--- Supports both keyboard shortcuts and mouse-clickable buttons.
-local function youcubeRemoteUI()
-    uiBlocked = true
-    local w, h = term.getSize()
-    local pal = palette()
-    local capture = false
-    local volume = 50
-    local playing = true
+-- YouCube remote screen -----------------------------------------------------
 
-    -- Button definitions: { row, x1, x2, label, handler }
+local function youcubeRemoteUI()
+    local w, h = term.getSize()
     local btns = {}
 
-    local function addBtn(row, x1, x2, handler)
-        table.insert(btns, { row = row, x1 = x1, x2 = x2, handler = handler })
+    local function online() return ycStatus and (os.clock() - ycStatus.seen) < YC_STALE_AFTER end
+    local function captured() return ycStatus and ycStatus.captured end
+
+    local function setCapture(on)
+        sendYouCubeRemote("capture_toggle", { captured = on })
+        if ycStatus then ycStatus.captured = on end
+    end
+    local function doPause()
+        local payload = nil
+        if ycStatus then payload = { paused = not ycStatus.paused } end
+        sendYouCubeRemote("play_pause", payload)
+    end
+    local function setVolume(pct)
+        pct = math.max(0, math.min(100, math.floor(pct + 0.5)))
+        sendYouCubeRemote("volume_set", { volume = pct })
+        if ycStatus then ycStatus.volume = pct end
+    end
+    local function stepVolume(d)
+        setVolume(((ycStatus and ycStatus.volume) or 100) + d)
     end
 
+    -- Ask the player to report right away (it also reports every few seconds)
+    sendYouCubeRemote("status_request")
+
     local function draw()
+        local pal = palette()
+        btns = {}
+        local function btn(y, x1, label, bg, fg, fn)
+            setColors(term, fg or colors.white, bg)
+            term.setCursorPos(x1, y)
+            term.write(label)
+            btns[#btns + 1] = { y = y, x1 = x1, x2 = x1 + #label - 1, fn = fn }
+            return x1 + #label + 1
+        end
+
         setColors(term, pal.fg, pal.bg)
         term.clear()
         setColors(term, pal.headerFg, pal.headerBg)
         term.setCursorPos(1, 1)
-        term.write(( " YOUCUBE REMOTE  [Y] Close" .. string.rep(" ", w) ):sub(1, w))
+        term.write((" YOUCUBE REMOTE" .. string.rep(" ", w)):sub(1, w))
 
-        -- Capture toggle button (row 3)
-        setColors(term, pal.fg, pal.bg)
+        -- Now playing
+        setColors(term, pal.accentFg, pal.bg)
         term.setCursorPos(2, 3)
-        term.write("Capture Input: ")
-        local capBg = capture and colors.green or colors.red
-        local capTxt = capture and " [ON] " or " [OFF]"
-        setColors(term, colors.white, capBg)
-        term.setCursorPos(16, 3)
-        term.write(capTxt)
-        addBtn(3, 16, 16 + #capTxt - 1, function()
-            capture = not capture
-            sendYouCubeRemote("capture_toggle", { captured = capture })
-            draw()
-        end)
-
-        -- Play/Pause button (row 5)
-        term.setCursorPos(2, 5)
-        term.write("Playback: ")
-        local ppBg = playing and colors.red or colors.green
-        local ppTxt = playing and " [Pause] " or " [Play ] "
-        setColors(term, colors.white, ppBg)
-        term.setCursorPos(12, 5)
-        term.write(ppTxt)
-        addBtn(5, 12, 12 + #ppTxt - 1, function()
-            playing = not playing
-            sendYouCubeRemote("play_pause", { playing = playing })
-            draw()
-        end)
-
-        -- Volume bar + Vol-/Vol+ buttons (row 7)
+        term.write(("Now playing:"):sub(1, w - 2))
+        local title = (ycStatus and ycStatus.title ~= "") and ycStatus.title or "-"
+        local avail = w - 2
+        if #title > avail then
+            local maxScroll = #title - avail
+            local pos = marqueePhase % (maxScroll + 4)
+            local startIdx = math.min(maxScroll, pos) + 1
+            title = title:sub(startIdx, startIdx + avail - 1)
+        end
         setColors(term, pal.fg, pal.bg)
-        term.setCursorPos(2, 7)
-        term.write(string.format("Volume: %d%%  ", volume))
-        local volBarW = math.min(20, w - 20)
-        local filled = math.floor(volume / 100 * volBarW + 0.5)
-        setColors(term, colors.white, colors.gray)
-        term.setCursorPos(18, 7)
-        term.write(string.rep(" ", volBarW))
-        setColors(term, colors.white, colors.lime)
-        term.setCursorPos(18, 7)
-        term.write(string.rep("#", filled))
+        term.setCursorPos(2, 4)
+        term.write(title)
 
-        local volMinusX = math.min(39, w - 4)
-        local volPlusX = math.min(43, w - 4)
-        if volMinusX > 18 + volBarW + 1 then
-            setColors(term, colors.white, colors.gray)
-            term.setCursorPos(volMinusX, 7)
-            term.write("[-]")
-            addBtn(7, volMinusX, volMinusX + 2, function()
-                volume = math.max(0, volume - 10)
-                sendYouCubeRemote("volume_down", { volume = volume })
-                draw()
-            end)
+        local label, fg
+        if not ycStatus then
+            label, fg = "No player heard yet", colors.red
+        elseif not online() then
+            label, fg = "Player offline (" .. math.floor(os.clock() - ycStatus.seen) .. "s)", colors.red
+        elseif ycStatus.state == "idle" then
+            label, fg = "Idle", colors.lightGray
+        elseif ycStatus.paused then
+            label, fg = "Paused", colors.yellow
+        else
+            label, fg = "Playing", colors.lime
         end
-        if volPlusX > volMinusX + 3 and volPlusX <= w - 2 then
-            setColors(term, colors.white, colors.lime)
-            term.setCursorPos(volPlusX, 7)
-            term.write("[+]")
-            addBtn(7, volPlusX, volPlusX + 2, function()
-                volume = math.min(100, volume + 10)
-                sendYouCubeRemote("volume_up", { volume = volume })
-                draw()
-            end)
-        end
+        setColors(term, fg, pal.bg)
+        term.setCursorPos(2, 5)
+        term.write(label:sub(1, w - 2))
 
-        -- Keystroke hint (row 9)
+        -- Transport
+        local paused = ycStatus and ycStatus.paused
+        local x = 2
+        x = btn(7, x, " Restart ", colors.gray, colors.white, function() sendYouCubeRemote("restart") end)
+        x = btn(7, x, paused and " Play " or " Pause ", paused and colors.green or colors.orange, colors.white, doPause)
+        btn(7, x, " Skip ", colors.gray, colors.white, function() sendYouCubeRemote("skip") end)
+
+        -- Volume
+        local vol = (ycStatus and ycStatus.volume) or 100
         setColors(term, pal.fg, pal.bg)
         term.setCursorPos(2, 9)
-        term.write("Keystroke: type any key")
+        term.write(string.format("Volume: %d%%", vol))
+        local barX, barW = 6, math.max(4, w - 12)
+        btn(10, 2, "[-]", colors.gray, colors.white, function() stepVolume(-10) end)
+        setColors(term, colors.white, colors.gray)
+        term.setCursorPos(barX, 10)
+        term.write(string.rep(" ", barW))
+        local filled = math.floor(vol / 100 * barW + 0.5)
+        setColors(term, colors.white, colors.lime)
+        term.setCursorPos(barX, 10)
+        term.write(string.rep(" ", filled))
+        btns[#btns + 1] = { y = 10, x1 = barX, x2 = barX + barW - 1, bar = { x = barX, w = barW } }
+        btn(10, barX + barW + 1, "[+]", colors.gray, colors.white, function() stepVolume(10) end)
 
-        -- Footer
+        -- Keyboard capture
+        local cap = captured()
+        setColors(term, pal.fg, pal.bg)
+        term.setCursorPos(2, 12)
+        term.write("Send my keyboard:")
+        btn(13, 2, cap and " ON  " or " OFF ", cap and colors.green or colors.red, colors.white, function() setCapture(not cap) end)
+        if cap then
+            setColors(term, colors.yellow, pal.bg)
+            term.setCursorPos(9, 13)
+            term.write("Esc = stop")
+        end
+
         setColors(term, pal.footerFg, pal.footerBg)
-        term.setCursorPos(1, h)
-        term.write(( " [C] Capture  [P] Play/Pause  [-] Vol-  [=] Vol+  [K] Key  [T] Text  [Esc/Y] Close" .. string.rep(" ", w) ):sub(1, w))
+        term.setCursorPos(1, h); term.write(string.rep(" ", w)); term.setCursorPos(1, h)
+        if cap then
+            term.write((" Keys go to the player"):sub(1, w))
+        else
+            term.write((" Space Pause  S Skip  R Restart  Esc Back"):sub(1, w))
+        end
     end
 
-    draw()
+    local REDRAW = { timer = true, modem_message = true }
+    local SPECIAL_KEYS = { enter = true, backspace = true, tab = true, up = true, down = true,
+        left = true, right = true, delete = true, home = true, ["end"] = true, pageUp = true, pageDown = true }
 
     while true do
-        local ev, p1, p2, p3 = uiPull()
+        draw()
+        local ev, p1, p2, p3 = uiPull(REDRAW)
         if ev == "key" then
-            if p1 == keys.escape or p1 == keys.y then
-                return
-            elseif p1 == keys.c then
-                capture = not capture
-                sendYouCubeRemote("capture_toggle", { captured = capture })
-                draw()
-            elseif p1 == keys.p then
-                playing = not playing
-                sendYouCubeRemote("play_pause", { playing = playing })
-                draw()
-            elseif p1 == keys.minus then
-                volume = math.max(0, volume - 10)
-                sendYouCubeRemote("volume_down", { volume = volume })
-                draw()
-            elseif p1 == keys.equals then
-                volume = math.min(100, volume + 10)
-                sendYouCubeRemote("volume_up", { volume = volume })
-                draw()
-            elseif p1 == keys.k then
-                local keyName = remoteTextInput("Keystroke Injection", "Key name (e.g. space, enter, r, d):", "")
-                if keyName then
-                    sendYouCubeRemote("keystroke", { key = keyName })
+            if captured() then
+                if p1 == keys.escape then
+                    setCapture(false)
+                else
+                    local name = keys.getName(p1)
+                    if name and SPECIAL_KEYS[name] then
+                        sendYouCubeRemote("keystroke", { key = name })
+                    end
                 end
-                draw()
-            elseif p1 == keys.t then
-                local text = remoteTextInput("Send Text", "Text to type:", "")
-                if text then
-                    sendYouCubeRemote("text", { text = text })
+            else
+                if p1 == keys.escape or p1 == keys.y then
+                    return
+                elseif p1 == keys.space or p1 == keys.p then doPause()
+                elseif p1 == keys.s or p1 == keys.d then sendYouCubeRemote("skip")
+                elseif p1 == keys.r then sendYouCubeRemote("restart")
+                elseif p1 == keys.minus then stepVolume(-10)
+                elseif p1 == keys.equals then stepVolume(10)
+                elseif p1 == keys.c or p1 == keys.k then setCapture(true)
                 end
-                draw()
             end
         elseif ev == "char" then
-            sendYouCubeRemote("keystroke", { key = p1 })
-            draw()
+            if captured() then
+                sendYouCubeRemote("keystroke", { key = p1 })
+            end
         elseif ev == "mouse_click" then
             for _, b in ipairs(btns) do
-                if p3 == b.row and p2 >= b.x1 and p2 <= b.x2 then
-                    b.handler()
+                if p3 == b.y and p2 >= b.x1 and p2 <= b.x2 then
+                    if b.bar then
+                        setVolume((p2 - b.bar.x + 1) / b.bar.w * 100)
+                    else
+                        b.fn()
+                    end
                     break
                 end
             end
         end
     end
 end
+
+-- Actions: one place for every keyboard shortcut, toolbar button and menu item -------
+
+local function selectedRelay()
+    local r = selectedRelayId and findRelayById(selectedRelayId)
+    if not r then setToast("Select a relay first (tap its name)", "warn") end
+    return r
+end
+
+local runAction
+
+local function openMoreMenu()
+    local r = selectedRelayId and findRelayById(selectedRelayId)
+    local has = r ~= nil
+    local items = {
+        { label = "Pause / clear override", action = "pause", enabled = has },
+        { label = "Pin / unpin", action = "pin", enabled = has },
+        { label = "Move up", action = "moveup", enabled = has },
+        { label = "Move down", action = "movedown", enabled = has },
+        { label = "Delete relay", action = "delete", enabled = has },
+        { label = "YouCube remote", action = "youcube" },
+        { label = "Display settings", action = "settings" },
+        { label = "Cycle list style", action = "style" },
+        { label = "Network", action = "network" },
+    }
+    if not isPocket then items[#items + 1] = { label = "Monitor scale", action = "scale" } end
+    items[#items + 1] = { label = "Shortcuts / help", action = "help" }
+    local title = r and ("MORE: " .. (r.name or "Relay")) or "MORE"
+    local pick = menuScreen(title, items)
+    if pick then runAction(pick) end
+end
+
+runAction = function(name)
+    if name == "toggle" then
+        local r = selectedRelay()
+        if r then sendRelayCmd({ cmd = "toggle", id = r.id }) end
+    elseif name == "add" then
+        local fields = editRelayForm({})
+        if fields then
+            local res = sendRelayCmd({ cmd = "addRelay", data = fields })
+            if not isPocket and type(res) == "table" then selectedRelayId = res.id end
+        end
+    elseif name == "edit" then
+        local r = selectedRelay()
+        if r then
+            local fields = editRelayForm(r)
+            if fields then sendRelayCmd({ cmd = "editRelay", id = r.id, data = fields }) end
+        end
+    elseif name == "triggers" then
+        local r = selectedRelay()
+        if r then
+            local triggers = editTriggersForm(r)
+            if triggers then sendRelayCmd({ cmd = "editTriggers", id = r.id, data = triggers }) end
+        end
+    elseif name == "pause" then
+        local r = selectedRelay()
+        if r then sendRelayCmd({ cmd = "setPaused", id = r.id }) end
+    elseif name == "pin" then
+        local r = selectedRelay()
+        if r then sendRelayCmd({ cmd = "setPinned", id = r.id }) end
+    elseif name == "moveup" then
+        local r = selectedRelay()
+        if r then sendRelayCmd({ cmd = "moveRelay", id = r.id, dir = -1 }) end
+    elseif name == "movedown" then
+        local r = selectedRelay()
+        if r then sendRelayCmd({ cmd = "moveRelay", id = r.id, dir = 1 }) end
+    elseif name == "delete" then
+        local r = selectedRelay()
+        if r and confirmDialog("DELETE RELAY", 'Delete "' .. tostring(r.name or "Relay") .. '"? This cannot be undone.') then
+            sendRelayCmd({ cmd = "deleteRelay", id = r.id })
+            selectedRelayId = nil
+        end
+    elseif name == "style" then
+        if uiStyle == "compact" then uiStyle = "detailed"
+        elseif uiStyle == "detailed" then uiStyle = "spacious"
+        else uiStyle = "compact" end
+        persistSettings()
+    elseif name == "settings" then
+        if editSettingsForm() then persistSettings() end
+    elseif name == "network" then
+        if editNetworkForm() then
+            ycStatus = nil
+            if isPocket then
+                saveClientState()
+                clientSayHello()
+            else
+                saveConfig()
+            end
+        end
+    elseif name == "scale" then
+        if isPocket then setToast("Monitor scale is a base setting", "warn") else cycleMonitorScale() end
+    elseif name == "youcube" then
+        youcubeRemoteUI()
+    elseif name == "help" then
+        showHelpScreen(term)
+    elseif name == "menu" then
+        openMoreMenu()
+    end
+end
+
+local KEY_ACTIONS = {
+    [keys.enter] = "toggle", [keys.space] = "toggle",
+    [keys.a] = "add", [keys.e] = "edit", [keys.t] = "triggers",
+    [keys.p] = "pause", [keys.d] = "delete", [keys.n] = "pin",
+    [keys.comma] = "moveup", [keys.period] = "movedown",
+    [keys.v] = "style", [keys.c] = "settings", [keys.w] = "network",
+    [keys.h] = "help", [keys.s] = "scale", [keys.y] = "youcube", [keys.m] = "menu",
+}
+
+-- Handles a click inside the relay list area of the main terminal.
+-- Tapping the ON/OFF pill toggles; tapping a name selects (so Edit/Trig/More apply to it).
+local function handleListClick(x, y, w, h, rowMap, contentStartY, toolbarHits)
+    if y == h then
+        for _, hit in ipairs(toolbarHits or {}) do
+            if x >= hit.x1 and x <= hit.x2 then
+                runAction(hit.action)
+                return
+            end
+        end
+        return
+    end
+    if x == w then
+        if y == contentStartY then scrollOffset = math.max(0, scrollOffset - 1)
+        elseif y == h - 1 then scrollOffset = scrollOffset + 1 end
+        return
+    end
+    local id = rowMap[y]
+    if not id then return end
+    selectedRelayId = id
+    if x <= 7 then sendRelayCmd({ cmd = "toggle", id = id }) end
+end
+
+-- ===========================================================================
+-- Base Station Engine
+-- ===========================================================================
+
+local function hostNetwork(msg)
+    if hostExec(msg) then return end
+    local c = msg.cmd
+    if c == "get" then
+        broadcastSync()
+    elseif c == "location" then
+        lastPlayerPos = { x = msg.x, y = msg.y, z = msg.z }
+        lastGPSFixTime = os.clock()
+        evaluateAutomations()
+    elseif c == "hello" and msg.clientId then
+        if baseClientSettings[msg.clientId] then
+            send({ cmd = "clientConfig", clientId = msg.clientId, data = baseClientSettings[msg.clientId] })
+        elseif msg.settings then
+            baseClientSettings[msg.clientId] = msg.settings
+            saveConfig()
+        end
+        broadcastSync()
+    elseif c == "setClientConfig" and msg.clientId and msg.data then
+        baseClientSettings[msg.clientId] = msg.data
+        saveConfig()
+    elseif c == "youcube_remote" and not msg.fwd then
+        -- Range extender: re-send once so the player hears pockets that are
+        -- out of its range. The player drops duplicates by rid.
+        msg.fwd = true
+        send(msg)
+    elseif c == "youcube_status" then
+        noteYouCubeStatus(msg)
+    end
+end
+
+local function runHost()
+    loadConfig()
+    tuneToNetwork(networkName)
+    local clockTimer = os.startTimer(1.0)
+    local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
+
+    -- Timers, redstone and network traffic: also used while a form/menu is open
+    local function background(ev, p1, p2, p3, msg)
+        if ev == "timer" then
+            if p1 == clockTimer then
+                evaluateAutomations()
+                clockTimer = os.startTimer(1.0)
+            elseif p1 == marqueeTimer then
+                marqueePhase = marqueePhase + 1
+                marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
+            elseif activePulses[p1] then
+                local info = activePulses[p1]
+                local r = findRelayById(info.id)
+                if r then
+                    r.state = info.targetState
+                    commit()
+                end
+                activePulses[p1] = nil
+            end
+            return true
+        elseif ev == "redstone" then
+            evaluateAutomations()
+            return true
+        elseif ev == "modem_message" then
+            if type(msg) == "table" then hostNetwork(msg) end
+            return true
+        end
+        return false
+    end
+    backgroundHandler = background
+
+    while true do
+        local tw, th = term.getSize()
+        local termRowMap, newOffset, termHits, termStartY =
+            drawUI(term, selectedRelayId, scrollOffset, currentToast(), nil, true)
+        scrollOffset = newOffset
+
+        local mon = peripheral.find("monitor")
+        local monRowMap, monStartY = {}, 2
+        if mon then
+            mon.setTextScale(monitorScale)
+            local _o, _h
+            monRowMap, _o, _h, monStartY = drawUI(mon, nil, scrollOffset)
+        end
+
+        local ev, p1, p2, p3, msg = os.pullEvent()
+
+        if background(ev, p1, p2, p3, msg) then
+            -- handled
+        elseif ev == "key" then
+            if p1 == keys.up then
+                moveSelection(-1)
+            elseif p1 == keys.down then
+                moveSelection(1)
+            elseif KEY_ACTIONS[p1] then
+                runAction(KEY_ACTIONS[p1])
+            end
+        elseif ev == "mouse_scroll" then
+            scrollOffset = math.max(0, scrollOffset + p1)
+        elseif ev == "mouse_click" then
+            handleListClick(p2, p3, tw, th, termRowMap, termStartY, termHits)
+        elseif ev == "monitor_touch" and mon then
+            -- Monitors have no selection or toolbar: any tap on a row toggles it
+            local mw, mh = mon.getSize()
+            if p2 == mw then
+                if p3 == monStartY then scrollOffset = math.max(0, scrollOffset - 1)
+                elseif p3 == mh - 1 then scrollOffset = scrollOffset + 1 end
+            else
+                local clickedId = monRowMap[p3]
+                if clickedId then
+                    selectedRelayId = clickedId
+                    hostToggle(clickedId)
+                end
+            end
+        end
+    end
+end
+
+-- ===========================================================================
+-- Pocket Client Engine (UI and GPS run in parallel threads)
+-- ===========================================================================
 
 local function runClient()
     loadClientState()
@@ -1792,20 +2070,8 @@ local function runClient()
         local heartbeatTimer = os.startTimer(5.0)
         local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
 
-        while true do
-            if uiBlocked then
-                uiBlocked = false
-                os.cancelTimer(heartbeatTimer); os.cancelTimer(marqueeTimer)
-                heartbeatTimer = os.startTimer(0.1)
-                marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
-            end
-            local banner = clientBanner()
-            local emptyMsg = (not hasEverSynced) and "Waiting for base station..." or nil
-            local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset, banner, emptyMsg)
-            scrollOffset = newOffset
-
-            local ev, p1, p2, p3, msg = os.pullEvent()
-
+        -- Timers and base traffic: also used while a form/menu is open
+        local function background(ev, p1, p2, p3, msg)
             if ev == "timer" then
                 if p1 == heartbeatTimer then
                     send({ cmd = "get" })
@@ -1814,79 +2080,49 @@ local function runClient()
                     marqueePhase = marqueePhase + 1
                     marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
                 end
+                return true
+            elseif ev == "modem_message" then
+                if type(msg) == "table" then
+                    if msg.cmd == "sync" then
+                        relays = msg.data or {}
+                        lastSyncTime = os.clock()
+                        hasEverSynced = true
+                        saveClientState()
+                    elseif msg.cmd == "clientConfig" and msg.clientId == clientId then
+                        applyReceivedClientConfig(msg.data)
+                    elseif msg.cmd == "youcube_status" then
+                        noteYouCubeStatus(msg)
+                    end
+                end
+                return true
+            end
+            return false
+        end
+        backgroundHandler = background
+
+        while true do
+            local w, h = term.getSize()
+            local banner = currentToast() or clientBanner()
+            local emptyMsg = (not hasEverSynced) and "Waiting for base station..." or nil
+            local termRowMap, newOffset, hits, startY = drawUI(term, selectedRelayId, scrollOffset, banner, emptyMsg, true)
+            scrollOffset = newOffset
+
+            local ev, p1, p2, p3, msg = os.pullEvent()
+
+            if background(ev, p1, p2, p3, msg) then
+                -- handled
             elseif ev == "key" then
                 if p1 == keys.up then
                     moveSelection(-1)
                 elseif p1 == keys.down then
                     moveSelection(1)
-                elseif (p1 == keys.enter or p1 == keys.space) and selectedRelayId then
-                    send({ cmd = "toggle", id = selectedRelayId })
-                elseif p1 == keys.a then
-                    local fields = editRelayForm({})
-                    if fields then send({ cmd = "addRelay", data = fields }) end
-                elseif p1 == keys.e and selectedRelayId then
-                    local r = findRelayById(selectedRelayId)
-                    if r then
-                        local fields = editRelayForm(r)
-                        if fields then send({ cmd = "editRelay", id = selectedRelayId, data = fields }) end
-                    end
-                elseif p1 == keys.t and selectedRelayId then
-                    local r = findRelayById(selectedRelayId)
-                    if r then
-                        local triggers = editTriggersForm(r)
-                        if triggers then send({ cmd = "editTriggers", id = selectedRelayId, data = triggers }) end
-                    end
-                elseif p1 == keys.p and selectedRelayId then
-                    send({ cmd = "setPaused", id = selectedRelayId })
-                elseif p1 == keys.d and selectedRelayId then
-                    send({ cmd = "deleteRelay", id = selectedRelayId })
-                elseif p1 == keys.n and selectedRelayId then
-                    send({ cmd = "setPinned", id = selectedRelayId })
-                elseif p1 == keys.comma and selectedRelayId then
-                    send({ cmd = "moveRelay", id = selectedRelayId, dir = -1 })
-                elseif p1 == keys.period and selectedRelayId then
-                    send({ cmd = "moveRelay", id = selectedRelayId, dir = 1 })
-                elseif p1 == keys.v then
-                    if uiStyle == "compact" then uiStyle = "detailed"
-                    elseif uiStyle == "detailed" then uiStyle = "spacious"
-                    else uiStyle = "compact" end
-                    persistSettings()
-                elseif p1 == keys.c then
-                    if editSettingsForm() then persistSettings() end
-                elseif p1 == keys.w then
-                    if editNetworkForm() then
-                        saveClientState()
-                        clientSayHello()
-                    end
-                elseif p1 == keys.h then
-                    showHelpScreen(term)
-                elseif p1 == keys.y then
-                    youcubeRemoteUI()
+                elseif KEY_ACTIONS[p1] and KEY_ACTIONS[p1] ~= "scale" then
+                    runAction(KEY_ACTIONS[p1])
                 end
             elseif ev == "mouse_scroll" then
                 scrollOffset = math.max(0, scrollOffset + p1)
             elseif ev == "mouse_click" then
-                local w, h = term.getSize()
-                local contentStartY = banner and 3 or 2
-                if p2 == w then
-                    if p3 == contentStartY then scrollOffset = math.max(0, scrollOffset - 1)
-                    elseif p3 == h - 1 then scrollOffset = scrollOffset + 1 end
-                else
-                    local clickedId = termRowMap[p3]
-                    if clickedId then
-                        selectedRelayId = clickedId
-                        send({ cmd = "toggle", id = clickedId })
-                    end
-                end
-            elseif ev == "modem_message" and type(msg) == "table" then
-                if msg.cmd == "sync" then
-                    relays = msg.data or {}
-                    lastSyncTime = os.clock()
-                    hasEverSynced = true
-                    saveClientState()
-                elseif msg.cmd == "clientConfig" and msg.clientId == clientId then
-                    applyReceivedClientConfig(msg.data)
-                end
+                handleListClick(p2, p3, w, h, termRowMap, startY, hits)
             end
         end
     end
