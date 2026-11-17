@@ -1703,10 +1703,11 @@ local function youcubeRemoteUI()
         local label, fg
         if not ycStatus then
             label, fg = "No player heard yet", colors.red
+        elseif ycStatus.state == "idle" then
+            -- An idle player only listens between songs, so silence is normal
+            label, fg = "Idle (waiting for a song)", colors.lightGray
         elseif not online() then
             label, fg = "Player offline (" .. math.floor(os.clock() - ycStatus.seen) .. "s)", colors.red
-        elseif ycStatus.state == "idle" then
-            label, fg = "Idle", colors.lightGray
         elseif ycStatus.paused then
             label, fg = "Paused", colors.yellow
         else
