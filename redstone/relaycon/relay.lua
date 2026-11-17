@@ -44,6 +44,7 @@ local lastGPSFixTime = nil
 local activePulses = {}      -- [timerId] = { id = relayId, targetState = bool }
 local sensorState = {}       -- [relayId] = { lastInput, armedUntil } (not persisted)
 local marqueePhase = 0
+local uiBlocked = false      -- set by any blocking screen (forms/help); main loops then restart their timers
 
 -- Network identity
 local networkName = "default"
@@ -867,6 +868,7 @@ end
 
 -- Returns true if saved, false if cancelled. Mutates `state` in place.
 local function runForm(target, title, fields, state)
+    uiBlocked = true
     local w, h = target.getSize()
     local fieldsAreaH = math.max(2, h - 4)
     local focusIdx = 1
@@ -1172,6 +1174,7 @@ local HELP_ITEMS = {
 }
 
 local function showHelpScreen(target)
+    uiBlocked = true
     local w, h = target.getSize()
     local scroll = 0
     local viewH = math.max(1, h - 2)
@@ -1335,6 +1338,14 @@ local function runHost()
     local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
 
     while true do
+        if uiBlocked then
+            -- A blocking screen ate our timer events while it was open: restart them
+            uiBlocked = false
+            os.cancelTimer(clockTimer); os.cancelTimer(marqueeTimer)
+            clockTimer = os.startTimer(0.1)
+            marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
+        end
+
         local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset)
         scrollOffset = newOffset
 
@@ -1469,9 +1480,10 @@ local function runHost()
                 saveConfig()
             elseif msg.cmd == "setState" and msg.id ~= nil and msg.state ~= nil then
                 hostSetState(msg.id, msg.state)
-            elseif msg.cmd == "youcube_remote" then
+            elseif msg.cmd == "youcube_remote" and not msg.fwd then
                 -- YouCube remote commands are pass-through to the youcube client,
                 -- the base just re-transmits them so they reach everyone on the channel.
+                msg.fwd = true -- forwarded once only; the player drops duplicates by rid
                 send(msg)
             end
         end
@@ -1514,8 +1526,13 @@ end
 -- YouCube Remote UI helpers (pocket client only)
 -- ===========================================================================
 
+local remoteSeq = 0
 local function sendYouCubeRemote(action, payload)
-    local msg = { cmd = "youcube_remote", action = action }
+    remoteSeq = remoteSeq + 1
+    local msg = {
+        cmd = "youcube_remote", action = action,
+        rid = tostring(clientId) .. ":" .. tostring(os.epoch and os.epoch("utc") or os.time()) .. ":" .. remoteSeq,
+    }
     if payload then
         for k, v in pairs(payload) do msg[k] = v end
     end
@@ -1524,6 +1541,7 @@ end
 
 -- Simple text input dialog. Returns the entered string or nil if cancelled.
 local function remoteTextInput(title, prompt, default)
+    uiBlocked = true
     local w, h = term.getSize()
     local pal = palette()
     local buf = tostring(default or "")
@@ -1577,6 +1595,7 @@ end
 -- YouCube Remote UI screen. Opens a remote control panel for the YouCube client.
 -- Supports both keyboard shortcuts and mouse-clickable buttons.
 local function youcubeRemoteUI()
+    uiBlocked = true
     local w, h = term.getSize()
     local pal = palette()
     local capture = false
@@ -1734,6 +1753,12 @@ local function runClient()
         local marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
 
         while true do
+            if uiBlocked then
+                uiBlocked = false
+                os.cancelTimer(heartbeatTimer); os.cancelTimer(marqueeTimer)
+                heartbeatTimer = os.startTimer(0.1)
+                marqueeTimer = os.startTimer(MARQUEE_INTERVAL)
+            end
             local banner = clientBanner()
             local emptyMsg = (not hasEverSynced) and "Waiting for base station..." or nil
             local termRowMap, newOffset = drawUI(term, selectedRelayId, scrollOffset, banner, emptyMsg)
