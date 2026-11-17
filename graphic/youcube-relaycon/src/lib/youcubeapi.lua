@@ -512,7 +512,7 @@ end
     and [sanjuuni/websocket-player.lua](https://github.com/MCJack123/sanjuuni/blob/30dcabb4b56f1eb32c88e1bce384b0898367ebda/websocket-player.lua)
     @tparam Buffer buffer filled with frames
 ]]
-local function play_vid(buffer, force_fps, string_unpack)
+local function play_vid(buffer, force_fps, string_unpack, is_paused)
     if not string_unpack then
         string_unpack = string.unpack
     end
@@ -541,6 +541,15 @@ local function play_vid(buffer, force_fps, string_unpack)
     local start = os.epoch("utc")
     local frame_count = 0
     while true do
+        -- Pausing: hold on the current frame and push the timing origin forward
+        -- by however long we were paused so playback resumes in sync.
+        if is_paused and is_paused() then
+            local paused_at = os.epoch("utc")
+            while is_paused() do
+                os.pullEvent()
+            end
+            start = start + (os.epoch("utc") - paused_at)
+        end
         frame_count = frame_count + 1
         local frame
         if first then
