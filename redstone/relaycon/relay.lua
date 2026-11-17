@@ -1372,20 +1372,23 @@ local function hostSetPinned(id)
     commit()
 end
 
-local function hostSetState(idOrName, state)
+local function hostSetState(idOrName, state, side)
     local r = nil
     -- Try numeric ID first
     if type(idOrName) == "number" then
         r = findRelayById(idOrName)
     end
-    -- Fall back to matching by relayName (peripheral name)
+    -- Fall back to the peripheral name; if the caller gave a side, prefer the
+    -- relay entry for that exact side (one peripheral can drive several relays)
     if not r then
+        local fallback = nil
         for _, candidate in ipairs(relays) do
             if candidate.relayName == tostring(idOrName) then
-                r = candidate
-                break
+                if side and candidate.side == side then r = candidate; break end
+                fallback = fallback or candidate
             end
         end
+        r = r or fallback
     end
     if not r then return end
     r.override = true
@@ -1433,7 +1436,7 @@ local function hostExec(msg)
     elseif c == "setPinned" and msg.id then hostSetPinned(msg.id)
     elseif c == "deleteRelay" and msg.id then hostDeleteRelay(msg.id)
     elseif c == "moveRelay" and msg.id and msg.dir then hostMoveRelay(msg.id, msg.dir)
-    elseif c == "setState" and msg.id ~= nil and msg.state ~= nil then hostSetState(msg.id, msg.state)
+    elseif c == "setState" and msg.id ~= nil and msg.state ~= nil then hostSetState(msg.id, msg.state, msg.side)
     else return nil end
     return true
 end
