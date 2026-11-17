@@ -757,6 +757,29 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage)
 end
 
 -- ===========================================================================
+-- Blocking-screen event pump
+-- ===========================================================================
+-- Forms/dialogs call uiPull() instead of os.pullEvent(). It only returns input
+-- events; timers, redstone and modem traffic are handed to `backgroundHandler`
+-- (installed by the host/pocket main loop), so automations keep running and no
+-- network commands are lost while a form is open.
+
+local backgroundHandler = nil
+local UI_EVENTS = {
+    key = true, key_up = true, char = true, paste = true,
+    mouse_click = true, mouse_scroll = true, mouse_drag = true, mouse_up = true,
+    term_resize = true,
+}
+
+local function uiPull()
+    while true do
+        local e = table.pack(os.pullEvent())
+        if UI_EVENTS[e[1]] then return table.unpack(e, 1, e.n) end
+        if backgroundHandler then backgroundHandler(table.unpack(e, 1, e.n)) end
+    end
+end
+
+-- ===========================================================================
 -- Generic form engine: label above value, row-based scrolling, mouse + keys
 -- ===========================================================================
 
@@ -793,11 +816,27 @@ end
 
 -- Single-line text input. Redraws on every keystroke and scrolls sideways so
 -- the cursor (always at the end of the text) stays in view.
+-- Enter commits. Clicking anywhere outside the box, or Tab/Up/Down, commits and
+-- hands that click/key on to the form so focus is never "stuck" in the box.
 local function editTextField(target, x, y, w, field, state)
     local pal = palette()
     local original = state[field.key]
     local buf = tostring(original or "")
+    local errMsg = nil
     state[field.key] = buf
+
+    -- Returns true if the buffer was accepted (numbers must parse).
+    local function accept()
+        if field.type == "number" then
+            local n = tonumber(buf)
+            if n == nil then return false end
+            state[field.key] = n
+        else
+            state[field.key] = buf
+        end
+        return true
+    end
+
     while true do
         local visibleW = math.max(1, w - 2) -- room for scroll marker + cursor
         local shown, scrolled = buf, false
@@ -810,36 +849,37 @@ local function editTextField(target, x, y, w, field, state)
         local line = (scrolled and "<" or " ") .. shown .. "_"
         if #line < w then line = line .. string.rep(" ", w - #line) end
         target.write(line:sub(1, w))
+        setColors(target, colors.red, pal.bg)
+        target.setCursorPos(x, y + 1)
+        target.write(((errMsg or "") .. string.rep(" ", w)):sub(1, w))
 
-        local ev, p1 = os.pullEvent()
-        if ev == "char" then
+        local ev, p1, p2, p3 = uiPull()
+        if ev == "char" or ev == "paste" then
             buf = buf .. p1
-            state[field.key] = buf
+            errMsg = nil
         elseif ev == "key" then
             if p1 == keys.backspace then
                 buf = buf:sub(1, -2)
-                state[field.key] = buf
+                errMsg = nil
             elseif p1 == keys.enter then
-                if field.type == "number" then
-                    local n = tonumber(buf)
-                    if n == nil then
-                        setColors(target, colors.red, pal.bg)
-                        target.setCursorPos(x, y + 1)
-                        target.write(("Please enter a valid number"):sub(1, w))
-                        sleep(0.9)
-                        setColors(target, pal.bg, pal.bg)
-                        target.setCursorPos(x, y + 1)
-                        target.write(string.rep(" ", w))
-                    else
-                        state[field.key] = n
-                        return
-                    end
-                else
-                    state[field.key] = buf
-                    return
-                end
+                if accept() then return end
+                errMsg = "Please enter a valid number"
             elseif p1 == keys.escape then
                 state[field.key] = original
+                return
+            elseif p1 == keys.tab or p1 == keys.up or p1 == keys.down then
+                if accept() then
+                    os.queueEvent("key", p1)
+                else
+                    state[field.key] = original
+                end
+                return
+            end
+        elseif ev == "mouse_click" then
+            local inside = (p3 == y and p2 >= x and p2 < x + w)
+            if not inside then
+                if not accept() then state[field.key] = original end
+                os.queueEvent("mouse_click", p1, p2, p3)
                 return
             end
         end
@@ -943,7 +983,7 @@ local function runForm(target, title, fields, state)
         target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
         target.write((" [Tab]Next [Enter]Edit [S]ave [Esc]Cancel"):sub(1, w))
 
-        local ev, p1, p2, p3 = os.pullEvent()
+        local ev, p1, p2, p3 = uiPull()
         local field = visible[focusIdx]
 
         if ev == "key" then
@@ -1203,7 +1243,7 @@ local function showHelpScreen(target)
         target.setCursorPos(1, h); target.write(string.rep(" ", w)); target.setCursorPos(1, h)
         target.write((" [Up/Down] Scroll  [Enter/Esc/H] Close"):sub(1, w))
 
-        local ev, p1 = os.pullEvent()
+        local ev, p1 = uiPull()
         if ev == "key" then
             if p1 == keys.up then
                 scroll = math.max(0, scroll - 1)
@@ -1569,7 +1609,7 @@ local function remoteTextInput(title, prompt, default)
         term.setCursorPos(1, h)
         term.write(( " [Enter] Send  [Esc] Cancel" .. string.rep(" ", w) ):sub(1, w))
 
-        local ev, p1 = os.pullEvent()
+        local ev, p1 = uiPull()
         if ev == "char" then
             buf = buf:sub(1, cursor) .. p1 .. buf:sub(cursor + 1)
             cursor = cursor + 1
@@ -1695,7 +1735,7 @@ local function youcubeRemoteUI()
     draw()
 
     while true do
-        local ev, p1, p2, p3 = os.pullEvent()
+        local ev, p1, p2, p3 = uiPull()
         if ev == "key" then
             if p1 == keys.escape or p1 == keys.y then
                 return
