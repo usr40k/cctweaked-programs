@@ -247,6 +247,21 @@ end
 local yc_paused = false
 local yc_captured = false   -- when false, remote keystrokes are ignored
 local yc_volume = args.volume or 1.0
+-- Remote commands can arrive twice (directly from the pocket and again via the
+-- base station's forward), so every command carries a unique `rid` and we
+-- remember the recent ones to drop duplicates.
+local yc_seen = {}
+local yc_seen_order = {}
+local function yc_isDuplicate(rid)
+    if not rid then return false end
+    if yc_seen[rid] then return true end
+    yc_seen[rid] = true
+    yc_seen_order[#yc_seen_order + 1] = rid
+    if #yc_seen_order > 64 then
+        yc_seen[table.remove(yc_seen_order, 1)] = nil
+    end
+    return false
+end
 
 -- Open wireless modem for relaycon communication
 yc_modem = yc_openWireless()
@@ -417,7 +432,7 @@ local function play_audio(buffer, title)
         local audiodevice = audiodevices[i]
         audiodevice:reset()
         audiodevice:setLabel(title)
-        audiodevice:setVolume(args.volume)
+        audiodevice:setVolume(yc_volume)
     end
 
     while true do
@@ -573,7 +588,7 @@ local function play(url)
             end
 
             os.queueEvent("youcube:vid_playing", data)
-            libs.youcubeapi.play_vid(video_buffer, args.force_fps, string_unpack)
+            libs.youcubeapi.play_vid(video_buffer, args.force_fps, string_unpack, function() return yc_paused end)
             os.queueEvent("youcube:vid_eof", data)
         end
     end
@@ -592,7 +607,7 @@ local function play(url)
     local function _remote_listener()
         while true do
             local ev, p1, p2, p3, msg = os.pullEvent("modem_message")
-            if type(msg) == "table" and msg.cmd == "youcube_remote" then
+            if type(msg) == "table" and msg.cmd == "youcube_remote" and not yc_isDuplicate(msg.rid) then
                 local action = msg.action
                 if action == "play_pause" then
                     yc_paused = not yc_paused
