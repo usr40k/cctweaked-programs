@@ -25,7 +25,7 @@ local function is_lib(libs, lib)
     return false
 end
 
-local libs = { "youcubeapi", "numberformatter", "semver", "argparse", "string_pack" }
+local libs = { "youcubeapi", "numberformatter", "semver", "argparse", "string_pack", "ycauth", "yctheater", "ycui" }
 local lib_paths = { ".", "./lib", "./apis", "./modules", "/", "/lib", "/apis", "/modules" }
 
 -- LevelOS Support
@@ -139,9 +139,39 @@ parser:option "--relay-network"
     :target "relay_network"
     :args(1)
 
+parser:option "--theater-name"
+    :description "Name of this theater (shown in relaycon)"
+    :target "theater_name"
+    :args(1)
+
+parser:option "--rs-side"
+    :description "Output a redstone signal on one of THIS computer's sides (top, bottom, left, right, front, back, off)"
+    :target "rs_side"
+    :args(1)
+
+parser:option "--rs-when"
+    :description "Redstone is ON while 'playing' (default) or while 'idle'"
+    :target "rs_when"
+    :args(1)
+
+parser:flag "--pair"
+    :description "Forget the current hub pairing and show a new pairing code"
+    :target "pair"
+    :action "store_true"
+
 -- stylua: ignore end
 
 local args = parser:parse({ ... })
+
+do
+    local valid = { top = 1, bottom = 1, left = 1, right = 1, front = 1, back = 1, off = 1 }
+    if args.rs_side and not valid[args.rs_side] then
+        parser:error("--rs-side must be top, bottom, left, right, front, back or off")
+    end
+    if args.rs_when and args.rs_when ~= "playing" and args.rs_when ~= "idle" then
+        parser:error("--rs-when must be 'playing' or 'idle'")
+    end
+end
 
 if args.force_fps then
     args.force_fps = tonumber(args.force_fps)
@@ -174,7 +204,7 @@ if args.no_video and args.no_audio then
 end
 
 -- ===========================================================================
--- Wireless / Relaycon integration
+-- Theater / relaycon integration
 -- ===========================================================================
 
 local yc_modem = nil
@@ -182,7 +212,7 @@ local yc_channel = nil
 local yc_network = args.relay_network or "default"
 -- --relay-id can be a numeric relay ID or a relayName (peripheral name like "redstone_relay_13")
 local yc_relay_id = args.relay_id or nil
-local yc_relay_id_num = args.relay_id and tonumber(args.relay_id) or nil
+if yc_relay_id and tonumber(yc_relay_id) then yc_relay_id = tonumber(yc_relay_id) end
 local yc_relay_side = args.relay_side or "top"
 
 -- Deterministic name -> modem channel (same hash as relaycon)
@@ -197,18 +227,13 @@ end
 local function yc_openWireless()
     local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
     if not modem then
-        print("Warning: No wireless modem found. Relay control and remote input disabled.")
+        print("Warning: No wireless modem found. Remote control and relay output disabled.")
         return nil
     end
     if yc_channel then pcall(modem.close, yc_channel) end
     yc_channel = yc_nameToChannel(yc_network)
     modem.open(yc_channel)
     print(string.format("[Wireless] Modem opened on channel %d (network: %s)", yc_channel, yc_network))
-    if yc_relay_id then
-        print(string.format("[Relay] Configured to control relay '%s' on side '%s'", tostring(yc_relay_id), yc_relay_side))
-    else
-        print("[Relay] No --relay-id configured. Relay control disabled.")
-    end
     return modem
 end
 
@@ -218,68 +243,75 @@ local function yc_send(msg)
     end
 end
 
--- Turn the configured relay off (media starts playing)
-local function yc_relayOff()
-    if not yc_relay_id then return end
-    if not yc_modem then
-        print("[Relay] No wireless modem - cannot turn relay off")
-        return
-    end
-    print(string.format("[Relay] Turning relay %s OFF (side: %s)", tostring(yc_relay_id), yc_relay_side))
-    yc_send({ cmd = "setState", id = yc_relay_id, state = false, side = yc_relay_side })
-end
-
--- Turn the configured relay on (media stops playing)
-local function yc_relayOn()
-    if not yc_relay_id then return end
-    if not yc_modem then
-        print("[Relay] No wireless modem - cannot turn relay on")
-        return
-    end
-    print(string.format("[Relay] Turning relay %s ON (side: %s)", tostring(yc_relay_id), yc_relay_side))
-    yc_send({ cmd = "setState", id = yc_relay_id, state = true, side = yc_relay_side })
-end
-
--- ===========================================================================
--- Playback pause / remote control state
--- ===========================================================================
-
+-- Playback / remote-control state
 local yc_paused = false
 local yc_captured = false   -- when false, remote keystrokes are ignored
 local yc_volume = args.volume or 1.0
--- Live status, broadcast so the relaycon remote can show what is really playing
-local yc_state = "idle"        -- "idle" | "playing"
+local yc_state = "idle"     -- "idle" | "playing"
 local yc_currentTitle = ""
-local function yc_broadcastStatus()
-    yc_send({
-        cmd = "youcube_status",
-        title = yc_currentTitle,
-        state = yc_state,
-        paused = yc_paused,
-        volume = math.floor((yc_volume or 1) * 100 + 0.5),
-        captured = yc_captured,
-    })
-end
 
--- Remote commands can arrive twice (directly from the pocket and again via the
--- base station's forward), so every command carries a unique `rid` and we
--- remember the recent ones to drop duplicates.
-local yc_seen = {}
-local yc_seen_order = {}
-local function yc_isDuplicate(rid)
-    if not rid then return false end
-    if yc_seen[rid] then return true end
-    yc_seen[rid] = true
-    yc_seen_order[#yc_seen_order + 1] = rid
-    if #yc_seen_order > 64 then
-        yc_seen[table.remove(yc_seen_order, 1)] = nil
-    end
-    return false
-end
-
--- Open wireless modem for relaycon communication
 yc_modem = yc_openWireless()
-yc_broadcastStatus()
+
+local yc_handleCommand      -- assigned below, once the player pieces it drives exist
+local yc_theater
+local yc_history = libs.ycui.history_new("/youcube_history.json")
+
+-- Relay control goes through the paired hub (signed), never as a bare broadcast.
+local function yc_relayCmd(state)
+    if not yc_relay_id or not yc_theater or not yc_theater:is_paired() then return end
+    yc_theater:send_signed("yc_relay", { id = yc_relay_id, state = state, side = yc_relay_side })
+end
+
+-- Relay is ON while nothing plays and OFF while media plays.
+local function yc_applyRelay()
+    yc_relayCmd(yc_state ~= "playing")
+end
+
+-- Redstone output on this computer's own side (settings: rs_side / rs_when)
+local yc_rs_active_side = nil
+local function yc_applyRedstone()
+    local side = yc_theater.settings.rs_side
+    if side == "off" then side = nil end
+    if yc_rs_active_side and yc_rs_active_side ~= side then
+        pcall(redstone.setOutput, yc_rs_active_side, false)
+    end
+    yc_rs_active_side = side
+    if not side then return end
+    local playing = (yc_state == "playing")
+    local on = playing
+    if yc_theater.settings.rs_when == "idle" then on = not playing end
+    pcall(redstone.setOutput, side, on)
+end
+
+yc_theater = libs.yctheater.use(libs.ycauth).new({
+    path = "/youcube_theater.json",
+    network = yc_network,
+    name_override = args.theater_name,
+    transmit = yc_send,
+    toast = libs.ycui.toast,
+    status = function()
+        return {
+            title = yc_currentTitle, state = yc_state, paused = yc_paused,
+            volume = math.floor((yc_volume or 1) * 100 + 0.5), captured = yc_captured,
+        }
+    end,
+    command = function(action, p) return yc_handleCommand(action, p) end,
+    on_paired = function() yc_applyRelay() end,
+    on_change = function()
+        if yc_theater.hub_connected then yc_applyRelay() end
+    end,
+})
+
+if args.pair and yc_theater:is_paired() then yc_theater:unpair("Pairing reset") end
+if args.rs_side then yc_theater:set_setting("rs_side", args.rs_side) end
+if args.rs_when then yc_theater:set_setting("rs_when", args.rs_when) end
+
+-- Call whenever idle/playing changes
+local function yc_stateChanged()
+    yc_applyRedstone()
+    yc_applyRelay()
+    yc_theater:broadcast_status()
+end
 
 -- CraftOS-PC support --
 
@@ -499,42 +531,35 @@ local skip_key = settings.get("youcube.keys.skip") or keys.d
 local restart_key = settings.get("youcube.keys.restart") or keys.r
 local back_key = settings.get("youcube.keys.back") or keys.a
 
--- Remote commands from the relaycon pocket/base. Works both during playback and
--- at the "Enter Url" prompt (see yc_idle_listener).
-local function yc_handleRemote(msg)
-    if type(msg) ~= "table" or msg.cmd ~= "youcube_remote" or yc_isDuplicate(msg.rid) then
-        return
-    end
-    local action = msg.action
+-- Commands from a paired hub (already signature-checked by yctheater).
+yc_handleCommand = function(action, p)
+    p = p or {}
     if action == "play_pause" then
-        local want = msg.paused
+        if yc_state ~= "playing" then return end
+        local want = p.paused
         if want == nil then want = not yc_paused end
-        if want == yc_paused then
-            -- already in the requested state
-        elseif want then
-            yc_paused = true
-            os.queueEvent("youcube:pause")
-        else
-            yc_paused = false
-            os.queueEvent("youcube:resume")
+        if want ~= yc_paused then
+            yc_paused = want
+            os.queueEvent(want and "youcube:pause" or "youcube:resume")
         end
     elseif action == "volume_up" then
-        yc_setVolume(math.min(1, (yc_volume or args.volume or 1) + 0.1))
+        yc_setVolume(math.min(1, (yc_volume or 1) + 0.1))
     elseif action == "volume_down" then
-        yc_setVolume(math.max(0, (yc_volume or args.volume or 1) - 0.1))
+        yc_setVolume(math.max(0, (yc_volume or 1) - 0.1))
     elseif action == "volume_set" then
-        yc_setVolume(math.max(0, math.min(1, (tonumber(msg.volume) or 100) / 100)))
+        yc_setVolume(math.max(0, math.min(1, (tonumber(p.volume) or 100) / 100)))
     elseif action == "skip" then
         os.queueEvent("youcube:remote_key", skip_key)
     elseif action == "restart" then
         os.queueEvent("youcube:remote_key", restart_key)
     elseif action == "capture_toggle" then
-        yc_captured = msg.captured ~= false
+        yc_captured = p.captured ~= false
+        libs.ycui.toast(yc_captured and "Remote keyboard ON" or "Remote keyboard off", yc_captured and "ok" or "info")
     elseif action == "keystroke" then
-        -- A real remote keyboard: becomes ordinary char/key events, so it types
-        -- into the URL prompt and triggers the normal hotkeys. Needs capture on.
-        if yc_captured and msg.key then
-            local name = tostring(msg.key)
+        -- A real remote keyboard: becomes ordinary char/key events, so it types into
+        -- the on-screen search and triggers the normal hotkeys. Needs capture on.
+        if yc_captured and p.key then
+            local name = tostring(p.key)
             if #name == 1 then
                 os.queueEvent("char", name)
                 local k = keys[name:lower()]
@@ -544,22 +569,11 @@ local function yc_handleRemote(msg)
                 if k then os.queueEvent("key", k) end
             end
         end
-    end
-    -- (status_request and everything else fall through to the broadcast)
-    yc_broadcastStatus()
-end
-
--- Used at the prompt, where no song is playing: keep answering remotes and
--- keep the status fresh.
-local function yc_idle_listener()
-    local timer = os.startTimer(3)
-    while true do
-        local ev, p1, p2, p3, msg = os.pullEvent()
-        if ev == "modem_message" then
-            yc_handleRemote(msg)
-        elseif ev == "timer" and p1 == timer then
-            yc_broadcastStatus()
-            timer = os.startTimer(3)
+    elseif action == "text" then
+        if yc_captured and p.text then
+            for i = 1, #tostring(p.text) do
+                os.queueEvent("char", tostring(p.text):sub(i, i))
+            end
         end
     end
 end
@@ -681,30 +695,12 @@ local function play(url)
         end
     end
 
-    -- Remote command listener: handles play/pause, volume, capture toggle, keystroke injection.
-    -- Remote keystrokes use a dedicated event channel ("youcube:remote_key") so they cannot be
-    -- accidentally picked up by the local _hotkey_handler (which only pulls physical "key" events).
-    local function _remote_listener()
-        while true do
-            local ev, p1, p2, p3, msg = os.pullEvent("modem_message")
-            yc_handleRemote(msg)
-        end
-    end
-
-    -- Tell remotes what is playing, every few seconds
-    local function _status_heartbeat()
-        while true do
-            yc_broadcastStatus()
-            sleep(3)
-        end
-    end
-
     local function _play_media()
         yc_state = "playing"
         yc_currentTitle = tostring(data.title or "")
-        yc_broadcastStatus()
+        yc_history:set_title(url, data.title)
+        yc_stateChanged()
         os.queueEvent("youcube:playing")
-        yc_relayOff()
         parallel.waitForAll(_play_video, _play_audio)
     end
 
@@ -764,14 +760,13 @@ local function play(url)
         end
     end
 
-    parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler, _remote_listener, _remote_key_handler, _status_heartbeat)
+    parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler, _remote_key_handler)
 
-    -- Always restore relay state when playback ends (even if interrupted by skip/restart)
-    yc_relayOn()
+    -- Always restore idle state when playback ends (even if interrupted by skip/restart)
     yc_paused = false -- reset pause state for next media item
     yc_state = "idle"
     yc_currentTitle = ""
-    yc_broadcastStatus()
+    yc_stateChanged()
 
     if data.playlist_videos then
         return data.playlist_videos
@@ -818,24 +813,46 @@ local function play_playlist(playlist)
     end
 end
 
-local function main()
-    -- Nothing is playing yet, so the relay should be ON (it goes OFF while media plays)
-    yc_relayOn()
-    youcubeapi:detect_bestest_server(args.server, args.verbose)
-    pcall(update_checker)
+-- Settings + hooks for the smart-TV screens
+local yc_ui_ctx = {
+    theater = yc_theater, history = yc_history, network = yc_network,
+    get = function(key)
+        if key == "name" then return yc_theater.name
+        elseif key == "rs_side" then return yc_theater.settings.rs_side or "off"
+        elseif key == "rs_when" then return yc_theater.settings.rs_when or "playing" end
+    end,
+    set = function(key, value)
+        if key == "name" then yc_theater:set_name(value)
+        elseif key == "rs_side" or key == "rs_when" then
+            yc_theater:set_setting(key, value)
+            yc_applyRedstone()
+        elseif key == "unpair" then yc_theater:unpair("Unpaired")
+        elseif key == "newcode" then
+            yc_theater:new_code()
+            yc_theater:broadcast_status()
+        end
+    end,
+}
 
-    if not args.URL then
-        print("Enter Url or Search Term:")
-        term.setTextColor(colors.lightGray)
-        parallel.waitForAny(function() args.URL = read() end, yc_idle_listener)
-        term.setTextColor(colors.white)
+-- Plays one thing from the home screen. Errors (bad link, server down ...) come
+-- back to the home screen as a toast instead of killing the program.
+local function run_media(url)
+    args.URL = url
+    libs.ycui.loading("Loading...")
+    local ok, result = pcall(play, url)
+    if not ok then
+        if tostring(result):find("Terminated") then error(result, 0) end
+        yc_paused, yc_state, yc_currentTitle = false, "idle", ""
+        yc_stateChanged()
+        libs.youcubeapi.reset_term()
+        libs.ycui.toast(tostring(result):gsub("^.-:%d+: ", ""), "bad", 6)
+        return
     end
-
-    local playlist_videos = play(args.URL)
+    local playlist_videos = result
 
     if args.loop == true then
         while true do
-            play(args.URL)
+            play(url)
         end
     end
     if playlist_videos then
@@ -850,7 +867,28 @@ local function main()
     end
 
     while restart do
-        play(args.URL)
+        play(url)
+    end
+end
+
+local function main()
+    yc_stateChanged() -- nothing plays yet: relay ON, redstone idle state
+    youcubeapi:detect_bestest_server(args.server, args.verbose)
+    pcall(update_checker)
+
+    local first = args.URL
+    while true do
+        local url
+        if first then
+            url, first = first, nil
+        else
+            libs.youcubeapi.reset_term()
+            local action, value = libs.ycui.home(yc_ui_ctx)
+            if action ~= "play" then break end
+            url = value
+        end
+        yc_history:note(url)
+        run_media(url)
     end
 
     youcubeapi.websocket.close()
@@ -859,7 +897,10 @@ local function main()
         libs.youcubeapi.reset_term()
     end
 
+    -- Powering off: release the redstone output
+    if yc_rs_active_side then pcall(redstone.setOutput, yc_rs_active_side, false) end
+
     os.queueEvent("youcube:playback_ended")
 end
 
-main()
+parallel.waitForAny(main, function() yc_theater:run() end, libs.ycui.toast_thread)

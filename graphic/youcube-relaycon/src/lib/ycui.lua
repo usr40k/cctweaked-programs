@@ -513,6 +513,18 @@ function UI.text_entry(o)
     end
 end
 
+--- Full screen "please wait" splash; leaves the cursor below the message.
+function UI.loading(text)
+    local w, h = term.getSize()
+    setc(THEME.text, THEME.bg)
+    term.clear()
+    bar(1, w, "YouCube TV", clock_text())
+    local y = math.max(3, math.floor(h / 2))
+    put(1, y, centered(text, w), THEME.accent, THEME.bg)
+    term.setCursorPos(1, y + 2)
+    term.setTextColor(THEME.text)
+end
+
 -- ---------------------------------------------------------------------------
 -- Confirm dialog
 -- ---------------------------------------------------------------------------
