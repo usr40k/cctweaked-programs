@@ -58,6 +58,8 @@ local textSize = 1.0            -- pocket terminal text scale
 
 -- Host-only: settings remembered per client uuid
 local baseClientSettings = {}
+-- Host-only: paired YouCube theaters  [tid] = { name, secret }
+local theaters = {}
 
 -- Client-only: identity + connection tracking
 local clientId = nil
@@ -129,6 +131,200 @@ local PALETTES = {
 local function palette()
     return PALETTES[colorScheme] or PALETTES.default
 end
+
+-- ===========================================================================
+-- ycauth: SHA-256 / signing / pairing helpers.
+-- Embedded copy of graphic/youcube-relaycon/src/lib/ycauth.lua - keep them in sync.
+-- ===========================================================================
+local auth = (function()
+--[[ ycauth - hashing, signing and pairing helpers shared by the YouCube
+     player and the relaycon hub. Game-grade authentication: it keeps stray or
+     foreign devices from controlling a theater, it is not meant to stop a
+     determined attacker who can sniff the wireless channel. ]]
+
+local M = {}
+
+-- bit ops: CC:Tweaked ships bit32; fall back to the older `bit` API
+local band, bor, bxor, bnot, shr, shl
+if bit32 then
+    band, bor, bxor, bnot, shr, shl = bit32.band, bit32.bor, bit32.bxor, bit32.bnot, bit32.rshift, bit32.lshift
+elseif bit then
+    local B = bit
+    band, bor, bxor, bnot = B.band, B.bor, B.bxor, B.bnot
+    shr = function(a, n) return B.blogic_rshift(a, n) end
+    shl = function(a, n) return B.blshift(a, n) end
+else
+    error("ycauth: no bit library available")
+end
+
+local function rotr(x, n)
+    return bor(shr(x, n), band(shl(x, 32 - n), 0xffffffff))
+end
+
+local K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+}
+local H0 = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
+
+--- SHA-256 of a string, returned as 64 lowercase hex characters.
+function M.sha256(msg)
+    local len = #msg
+    msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64)
+    local bits = len * 8
+    msg = msg .. string.char(0, 0, 0, 0,
+        band(shr(bits, 24), 255), band(shr(bits, 16), 255), band(shr(bits, 8), 255), band(bits, 255))
+
+    local h = { H0[1], H0[2], H0[3], H0[4], H0[5], H0[6], H0[7], H0[8] }
+    local w = {}
+    for chunk = 1, #msg, 64 do
+        for i = 0, 15 do
+            local a, b, c, d = msg:byte(chunk + i * 4, chunk + i * 4 + 3)
+            w[i] = a * 16777216 + b * 65536 + c * 256 + d
+        end
+        for i = 16, 63 do
+            local x, y = w[i - 15], w[i - 2]
+            local s0 = bxor(rotr(x, 7), rotr(x, 18), shr(x, 3))
+            local s1 = bxor(rotr(y, 17), rotr(y, 19), shr(y, 10))
+            w[i] = band(w[i - 16] + s0 + w[i - 7] + s1, 0xffffffff)
+        end
+        local a, b, c, d, e, f, g, hh = h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]
+        for i = 0, 63 do
+            local S1 = bxor(rotr(e, 6), rotr(e, 11), rotr(e, 25))
+            local ch = bxor(band(e, f), band(bnot(e), g))
+            local t1 = band(hh + S1 + ch + K[i + 1] + w[i], 0xffffffff)
+            local S0 = bxor(rotr(a, 2), rotr(a, 13), rotr(a, 22))
+            local maj = bxor(band(a, b), band(a, c), band(b, c))
+            local t2 = band(S0 + maj, 0xffffffff)
+            hh, g, f, e = g, f, e, band(d + t1, 0xffffffff)
+            d, c, b, a = c, b, a, band(t1 + t2, 0xffffffff)
+        end
+        h[1] = band(h[1] + a, 0xffffffff); h[2] = band(h[2] + b, 0xffffffff)
+        h[3] = band(h[3] + c, 0xffffffff); h[4] = band(h[4] + d, 0xffffffff)
+        h[5] = band(h[5] + e, 0xffffffff); h[6] = band(h[6] + f, 0xffffffff)
+        h[7] = band(h[7] + g, 0xffffffff); h[8] = band(h[8] + hh, 0xffffffff)
+    end
+    local out = {}
+    for i = 1, 8 do out[i] = string.format("%08x", h[i]) end
+    return table.concat(out)
+end
+
+--- Milliseconds since epoch (real time, so it agrees between computers).
+function M.now()
+    if os.epoch then return os.epoch("utc") end
+    return os.time() * 1000
+end
+
+local seeded = false
+local function seed()
+    if seeded then return end
+    seeded = true
+    local id = (os.getComputerID and os.getComputerID()) or 0
+    math.randomseed(M.now() + id * 7919 + math.floor((os.clock() or 0) * 1000))
+    math.random(); math.random()
+end
+
+--- `nbytes` random bytes as hex. Whitened through SHA-256 with clock input.
+function M.random_hex(nbytes)
+    seed()
+    local out = ""
+    while #out < nbytes * 2 do
+        out = out .. M.sha256(math.random(0, 2147483647) .. ":" .. M.now() .. ":" .. (os.clock() or 0) .. ":" .. #out)
+    end
+    return out:sub(1, nbytes * 2)
+end
+
+--- Random six digit pairing code, e.g. "482913".
+function M.new_code()
+    seed()
+    return string.format("%06d", math.random(0, 999999))
+end
+
+--- "482913" -> "482-913" for display.
+function M.fmt_code(code)
+    return code:sub(1, 3) .. "-" .. code:sub(4)
+end
+
+--- Strips spaces/dashes so "482-913" and "482913" are the same code.
+function M.clean_code(code)
+    return (tostring(code or ""):gsub("[^%d]", ""))
+end
+
+--- Stable text form of a table of scalars: sorted "k=v" pairs.
+function M.canon(t)
+    if type(t) ~= "table" then return tostring(t or "") end
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        local v = t[k]
+        if v == nil then v = t[tonumber(k)] end
+        if type(v) == "table" then v = M.canon(v) end
+        parts[#parts + 1] = k .. "=" .. tostring(v)
+    end
+    return table.concat(parts, ";")
+end
+
+--- Signature over any number of parts, keyed with `secret`.
+function M.sign(secret, ...)
+    local parts = { ... }
+    for i = 1, select("#", ...) do parts[i] = tostring(parts[i] == nil and "" or parts[i]) end
+    return M.sha256(tostring(secret) .. "\0" .. table.concat(parts, "\0"))
+end
+
+--- Comparison that doesn't bail out at the first differing character.
+function M.eq(a, b)
+    a, b = tostring(a or ""), tostring(b or "")
+    local diff = (#a == #b) and 0 or 1
+    for i = 1, math.max(#a, #b) do
+        if a:byte(i) ~= b:byte(i) then diff = 1 end
+    end
+    return diff == 0
+end
+
+--- XOR two hex strings (result is as long as the shorter one).
+function M.xor_hex(a, b)
+    local n = math.min(#a, #b)
+    local out = {}
+    for i = 1, n do
+        out[i] = string.format("%x", bxor(tonumber(a:sub(i, i), 16), tonumber(b:sub(i, i), 16)))
+    end
+    return table.concat(out)
+end
+
+-- Pairing: the code never travels in clear text. The hub proves it knows the
+-- code (proof) and the new shared secret is masked with a key derived from it.
+function M.pair_proof(tid, nonce, code)
+    return M.sha256("pair\0" .. tid .. "\0" .. nonce .. "\0" .. M.clean_code(code))
+end
+
+function M.pair_mask(tid, nonce, code)
+    return M.sha256("mask\0" .. tid .. "\0" .. nonce .. "\0" .. M.clean_code(code))
+end
+
+--- Player's confirmation that it now holds `secret` (checked by the hub).
+function M.pair_ack(secret, tid, nonce)
+    return M.sha256("ack\0" .. secret .. "\0" .. tid .. "\0" .. nonce)
+end
+
+return M
+
+end)()
 
 -- ===========================================================================
 -- Identity & Networks
@@ -204,6 +400,7 @@ local function saveConfig()
         network = networkName,
         knownNetworks = knownNetworks,
         clients = baseClientSettings,
+        theaters = theaters,
     }))
     f.close()
 end
@@ -222,6 +419,7 @@ local function loadConfig()
             networkName = data.network or networkName
             knownNetworks = data.knownNetworks or knownNetworks
             baseClientSettings = data.clients or {}
+            theaters = data.theaters or {}
             nextRelayId = data.nextId or 1
         elseif type(data) == "table" then
             relays = data -- legacy bare-array save file
@@ -569,8 +767,10 @@ local function drawUI(target, activeSelectedId, offset, banner, emptyMessage, sh
     local bannerLines = 0
     if banner then
         bannerLines = 1
-        local isWarn = (banner.level == "warn")
-        setColors(target, isWarn and colors.white or colors.black, isWarn and colors.red or colors.yellow)
+        local lvl = banner.level
+        local bgc = (lvl == "warn") and colors.red or ((lvl == "ok") and colors.green or colors.yellow)
+        local fgc = (lvl == "warn" or lvl == "ok") and colors.white or colors.black
+        setColors(target, fgc, bgc)
         target.setCursorPos(1, 2)
         target.write((" " .. banner.text .. string.rep(" ", w)):sub(1, w))
     end
@@ -1246,6 +1446,7 @@ local HELP_ITEMS = {
     { "W", "Network name / switch network" },
     { "S", "Monitor scale (base only)" },
     { "Y", "YouCube remote" },
+    { "G", "Theaters / pairing" },
     { "H", "Show this screen" },
     { "Forms", "Tab/arrows move, Enter edits," },
     { "", "click away saves a field," },
@@ -1479,33 +1680,243 @@ local function clientSayHello()
     send({ cmd = "get" })
 end
 
--- YouCube player state, learned from the player's "youcube_status" broadcasts
--- (received by both base and pocket).
-local ycStatus = nil -- { title, state, paused, volume(0-100), captured, seen }
-local YC_STALE_AFTER = 8
+-- ===========================================================================
+-- Theaters: YouCube players paired to this hub
+-- ===========================================================================
+-- The base owns the list of paired theaters (with their shared secrets). Pockets
+-- never see a secret: they ask the base, and the base signs every command it
+-- forwards. Theaters ignore anything that isn't signed with their secret.
 
-local function noteYouCubeStatus(msg)
-    ycStatus = {
-        title = tostring(msg.title or ""),
-        state = msg.state or "idle",
-        paused = msg.paused and true or false,
-        volume = tonumber(msg.volume) or 100,
-        captured = msg.captured and true or false,
-        seen = os.clock(),
-    }
+local hubName = ((os.getComputerLabel and os.getComputerLabel()) or ("Hub " .. tostring(os.getComputerID()))):sub(1, 24)
+local theaterRt = {}        -- base: [tid] = { online, seen, st }
+local discovered = {}       -- base: [tid] = { name, nonce, seen }
+local pendingPair = {}      -- base: [tid] = { secret, nonce, started, by, name }
+local ycSeenRid, ycSeenOrder = {}, {}
+local ycList = { paired = {}, discovered = {} }   -- what the screens show
+local selectedTheater = nil
+local lastTheaterSig = nil
+local ycPingAt = 0
+local CLOCK_SKEW = 30000
+
+local function buildTheaterList()
+    local paired, disc = {}, {}
+    local now = os.clock()
+    for tid, t in pairs(theaters) do
+        local rt = theaterRt[tid] or {}
+        paired[#paired + 1] = { tid = tid, name = tostring(t.name or "Theater"), online = rt.online and true or false, st = rt.st }
+    end
+    table.sort(paired, function(a, b) return a.name:lower() < b.name:lower() end)
+    for tid, d in pairs(discovered) do
+        local rt = theaterRt[tid]
+        if now - d.seen < 8 and not (theaters[tid] and rt and rt.online) then
+            disc[#disc + 1] = { tid = tid, name = tostring(d.name or "Theater") }
+        end
+    end
+    table.sort(disc, function(a, b) return a.name:lower() < b.name:lower() end)
+    return { paired = paired, discovered = disc }
 end
 
-local remoteSeq = 0
-local function sendYouCubeRemote(action, payload)
-    remoteSeq = remoteSeq + 1
-    local msg = {
-        cmd = "youcube_remote", action = action,
-        rid = tostring(os.getComputerID()) .. ":" .. tostring(os.epoch and os.epoch("utc") or os.time()) .. ":" .. remoteSeq,
-    }
-    if payload then
-        for k, v in pairs(payload) do msg[k] = v end
+local function listSignature(list)
+    local parts = {}
+    for _, t in ipairs(list.paired) do
+        local st = t.st or {}
+        parts[#parts + 1] = table.concat({ t.tid, t.name, tostring(t.online), tostring(st.title), tostring(st.state),
+            tostring(st.paused), tostring(st.volume), tostring(st.captured) }, "|")
     end
-    send(msg)
+    for _, d in ipairs(list.discovered) do parts[#parts + 1] = "D" .. d.tid .. d.name end
+    return table.concat(parts, "\n")
+end
+
+-- Rebuilds the list and tells pockets when something changed (or always, if forced)
+local function refreshTheaters(force)
+    if isPocket then return end
+    ycList = buildTheaterList()
+    local sig = listSignature(ycList)
+    if force or sig ~= lastTheaterSig then
+        lastTheaterSig = sig
+        send({ cmd = "yc_theaters", paired = ycList.paired, discovered = ycList.discovered })
+    end
+end
+
+-- Signs and sends one command to a paired theater
+local function hostYcCommand(tid, action, p)
+    local t = theaters[tid]
+    if not t then return false end
+    p = p or {}
+    local ts, rid = auth.now(), auth.random_hex(6)
+    send({ cmd = "yc_cmd", tid = tid, ts = ts, rid = rid, action = action, p = p,
+        sig = auth.sign(t.secret, tid, ts, rid, action, auth.canon(p)) })
+    return true
+end
+
+local function rememberRid(rid)
+    if ycSeenRid[rid] then return false end
+    ycSeenRid[rid] = true
+    ycSeenOrder[#ycSeenOrder + 1] = rid
+    if #ycSeenOrder > 128 then ycSeenRid[table.remove(ycSeenOrder, 1)] = nil end
+    return true
+end
+
+local function notifyPair(by, tid, ok, reason, name)
+    if ok then
+        setToast("Paired " .. tostring(name or "theater"), "ok")
+    else
+        setToast("Pairing failed: " .. tostring(reason or "unknown"), "warn")
+    end
+    send({ cmd = "yc_pair_done", tid = tid, ok = ok, reason = reason, name = name, by = by })
+end
+
+local function hostPairRequest(tid, code, by)
+    local d = discovered[tid]
+    if not d or os.clock() - d.seen > 8 then return notifyPair(by, tid, false, "theater not found", d and d.name) end
+    local secret = auth.random_hex(16)
+    pendingPair[tid] = { secret = secret, nonce = d.nonce, started = os.clock(), by = by, name = d.name }
+    send({ cmd = "yc_pair", tid = tid, hub = hubName,
+        proof = auth.pair_proof(tid, d.nonce, code),
+        enc = auth.xor_hex(secret, auth.pair_mask(tid, d.nonce, code)) })
+    setToast("Pairing with " .. tostring(d.name) .. "...", "info")
+end
+
+local function hostPairResult(msg)
+    local pp = pendingPair[msg.tid]
+    if not pp then return end
+    pendingPair[msg.tid] = nil
+    if msg.ok and type(msg.ack) == "string" and auth.eq(msg.ack, auth.pair_ack(pp.secret, msg.tid, pp.nonce)) then
+        theaters[msg.tid] = { name = tostring(msg.name or pp.name or "Theater"):sub(1, 24), secret = pp.secret }
+        discovered[msg.tid] = nil
+        saveConfig()
+        notifyPair(pp.by, msg.tid, true, nil, theaters[msg.tid].name)
+        hostYcCommand(msg.tid, "ping")
+        refreshTheaters(true)
+    else
+        notifyPair(pp.by, msg.tid, false, msg.ok and "bad confirmation" or tostring(msg.reason or "failed"), pp.name)
+    end
+end
+
+local function hostUnpairTheater(tid)
+    local t = theaters[tid]
+    if not t then return end
+    hostYcCommand(tid, "unpair")   -- tell the player first, while we still have the secret
+    theaters[tid], theaterRt[tid] = nil, nil
+    saveConfig()
+    setToast("Unpaired " .. tostring(t.name), "warn")
+    if selectedTheater == tid then selectedTheater = nil end
+    refreshTheaters(true)
+end
+
+local function hostRenameTheater(tid, name)
+    local t = theaters[tid]
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if not t or name == "" then return end
+    t.name = name:sub(1, 24)
+    hostYcCommand(tid, "rename", { name = t.name })
+    saveConfig()
+    refreshTheaters(true)
+end
+
+-- A theater's signed status report
+local function hostYcStatus(msg)
+    local t = theaters[msg.tid]
+    local ts = tonumber(msg.ts)
+    if not t or type(msg.st) ~= "table" or not ts then return end
+    if math.abs(auth.now() - ts) > CLOCK_SKEW then return end
+    if not auth.eq(msg.sig, auth.sign(t.secret, msg.tid, ts, auth.canon(msg.st))) then return end
+    local rt = theaterRt[msg.tid] or {}
+    theaterRt[msg.tid] = rt
+    rt.seen = os.clock()
+    rt.st = msg.st
+    if msg.st.name and tostring(msg.st.name) ~= t.name then
+        t.name = tostring(msg.st.name):sub(1, 24)
+        saveConfig()
+    end
+    if not rt.online then
+        rt.online = true
+        setToast(t.name .. " connected", "ok")
+        send({ cmd = "yc_event", kind = "online", name = t.name })
+    end
+    refreshTheaters()
+end
+
+-- Relay control requested by a paired theater (signed, replay-protected)
+local function hostYcRelay(msg)
+    local t = theaters[msg.tid]
+    local ts = tonumber(msg.ts)
+    if not t or type(msg.p) ~= "table" or not ts or type(msg.rid) ~= "string" then return end
+    if math.abs(auth.now() - ts) > CLOCK_SKEW then return end
+    if not auth.eq(msg.sig, auth.sign(t.secret, msg.tid, ts, msg.rid, "yc_relay", auth.canon(msg.p))) then return end
+    if not rememberRid(msg.rid) then return end
+    if msg.p.id ~= nil and msg.p.state ~= nil then
+        hostSetState(msg.p.id, msg.p.state and true or false, msg.p.side)
+    end
+end
+
+-- Once a second: pairing timeouts, offline detection, keep-alive pings
+local function theaterTick()
+    if isPocket then return end
+    local now = os.clock()
+    for tid, pp in pairs(pendingPair) do
+        if now - pp.started > 10 then
+            pendingPair[tid] = nil
+            notifyPair(pp.by, tid, false, "no response", pp.name)
+        end
+    end
+    for tid, t in pairs(theaters) do
+        local rt = theaterRt[tid]
+        if rt and rt.online and now - rt.seen > 10 then
+            rt.online = false
+            setToast(t.name .. " disconnected", "warn")
+            send({ cmd = "yc_event", kind = "offline", name = t.name })
+        end
+    end
+    if now - ycPingAt >= 4 then
+        ycPingAt = now
+        for tid in pairs(theaters) do hostYcCommand(tid, "ping") end
+    end
+    refreshTheaters()
+end
+
+-- Screens and shortcuts use these; pocket and base share them -----------------
+
+local function findTheater(tid)
+    for _, t in ipairs(ycList.paired) do
+        if t.tid == tid then return t end
+    end
+end
+
+local function selTheater()
+    local t = selectedTheater and findTheater(selectedTheater)
+    if not t then
+        t = ycList.paired[1]
+        selectedTheater = t and t.tid or nil
+    end
+    return t
+end
+
+local function sendYouCubeRemote(action, payload, quiet)
+    local t = selTheater()
+    if not t then
+        if not quiet then setToast("No theater paired yet (More > Theaters)", "warn") end
+        return false
+    end
+    if isPocket then
+        send({ cmd = "yc_remote", tid = t.tid, action = action, p = payload or {}, clientId = clientId })
+    else
+        hostYcCommand(t.tid, action, payload or {})
+    end
+    return true
+end
+
+local function ycPair(tid, code)
+    if isPocket then send({ cmd = "yc_pair_req", tid = tid, code = code, by = clientId })
+    else hostPairRequest(tid, code, nil) end
+end
+
+local function ycUnpair(tid)
+    if isPocket then send({ cmd = "yc_unpair", tid = tid }) else hostUnpairTheater(tid) end
+end
+
+local function ycRename(tid, name)
+    if isPocket then send({ cmd = "yc_rename", tid = tid, name = name }) else hostRenameTheater(tid, name) end
 end
 
 -- Dialogs -------------------------------------------------------------------
@@ -1640,35 +2051,173 @@ local function menuScreen(title, items)
     end
 end
 
--- YouCube remote screen -----------------------------------------------------
+-- Theaters list + YouCube remote screens ------------------------------------
 
-local function youcubeRemoteUI()
+local youcubeRemoteUI   -- defined below
+
+local function askText(title, label, default)
+    local state = { v = default or "" }
+    if not runForm(term, title, { { key = "v", label = label, type = "text" } }, state) then return nil end
+    return state.v
+end
+
+local function theaterStatusText(t)
+    if not t.online then return "Offline" end
+    local st = t.st or {}
+    if st.state == "playing" then
+        return (st.paused and "Paused: " or "Playing: ") .. tostring(st.title or "")
+    end
+    return "Idle"
+end
+
+-- Per-theater menu. Returns "open" if the viewer wants its remote.
+local function theaterMenu(t)
+    local pick = menuScreen(t.name, {
+        { label = "Open remote", action = "open" },
+        { label = "Rename", action = "rename" },
+        { label = "Unpair", action = "unpair" },
+    })
+    if pick == "open" then
+        selectedTheater = t.tid
+        return "open"
+    elseif pick == "rename" then
+        local name = askText("Rename theater", "New name:", t.name)
+        if name and name ~= "" then ycRename(t.tid, name) end
+    elseif pick == "unpair" then
+        if confirmDialog("UNPAIR", 'Unpair "' .. t.name .. '"? It will show a new pairing code.') then ycUnpair(t.tid) end
+    end
+end
+
+local function theatersScreen()
+    local focus, top = 1, 0
+    local REDRAW = { modem_message = true, timer = true }
+    while true do
+        local w, h = term.getSize()
+        local pal = palette()
+        local rows = {}
+        for _, t in ipairs(ycList.paired) do rows[#rows + 1] = { kind = "paired", t = t } end
+        for _, d in ipairs(ycList.discovered) do rows[#rows + 1] = { kind = "new", t = d } end
+        local rh = 2
+        local view = math.max(1, math.floor((h - 2) / rh))
+        focus = math.max(1, math.min(focus, math.max(1, #rows)))
+        if focus - 1 < top then top = focus - 1 end
+        if focus > top + view then top = focus - view end
+        top = math.max(0, math.min(top, math.max(0, #rows - view)))
+
+        setColors(term, pal.fg, pal.bg)
+        term.clear()
+        setColors(term, pal.headerFg, pal.headerBg)
+        term.setCursorPos(1, 1)
+        term.write((" THEATERS" .. string.rep(" ", w)):sub(1, w))
+
+        local items = {}
+        if #rows == 0 then
+            setColors(term, colors.yellow, pal.bg)
+            term.setCursorPos(2, 3); term.write("No theaters yet.")
+            setColors(term, pal.fg, pal.bg)
+            local y = 5
+            for _, line in ipairs(wrapText("Start YouCube on a computer on this network. It shows a pairing code and appears here.", w - 2)) do
+                term.setCursorPos(2, y); term.write(line); y = y + 1
+            end
+        end
+        for i = 1, view do
+            local row = rows[top + i]
+            if not row then break end
+            local y = 2 + (i - 1) * rh
+            local f = (top + i == focus)
+            local bg = f and pal.selBg or pal.bg
+            setColors(term, pal.fg, bg)
+            term.setCursorPos(1, y); term.write(string.rep(" ", w))
+            term.setCursorPos(1, y + 1); term.write(string.rep(" ", w))
+            if row.kind == "paired" then
+                setColors(term, row.t.online and colors.lime or colors.red, bg)
+                term.setCursorPos(2, y); term.write("\7")
+                setColors(term, f and pal.selFg or pal.fg, bg)
+                term.setCursorPos(4, y); term.write(row.t.name:sub(1, w - 4))
+                setColors(term, colors.lightGray, bg)
+                term.setCursorPos(4, y + 1); term.write(theaterStatusText(row.t):sub(1, w - 4))
+            else
+                setColors(term, colors.yellow, bg)
+                term.setCursorPos(2, y); term.write(("+ New: " .. row.t.name):sub(1, w - 2))
+                setColors(term, colors.lightGray, bg)
+                term.setCursorPos(4, y + 1); term.write(("Tap to pair"):sub(1, w - 4))
+            end
+            items[#items + 1] = { y1 = y, y2 = y + 1, idx = top + i }
+        end
+        setColors(term, colors.white, colors.gray)
+        term.setCursorPos(1, h); term.write((" [Back]  tap a theater" .. string.rep(" ", w)):sub(1, w))
+
+        local function activate(row)
+            if not row then return end
+            if row.kind == "paired" then
+                if theaterMenu(row.t) == "open" then youcubeRemoteUI() end
+            else
+                local code = askText("Pair " .. row.t.name, "Code on the theater screen:", "")
+                if code then
+                    local digits = code:gsub("%D", "")
+                    if #digits == 6 then ycPair(row.t.tid, digits)
+                    else setToast("The code has 6 digits", "warn") end
+                end
+            end
+        end
+
+        local ev, p1, p2, p3 = uiPull(REDRAW)
+        if ev == "key" then
+            if p1 == keys.up then focus = math.max(1, focus - 1)
+            elseif p1 == keys.down then focus = math.min(#rows, focus + 1)
+            elseif p1 == keys.enter or p1 == keys.space then activate(rows[focus])
+            elseif p1 == keys.escape or p1 == keys.g or p1 == keys.backspace then return end
+        elseif ev == "mouse_scroll" then
+            focus = math.max(1, math.min(#rows, focus + p1))
+        elseif ev == "mouse_click" then
+            if p3 == h then return end
+            for _, it in ipairs(items) do
+                if p3 >= it.y1 and p3 <= it.y2 then focus = it.idx; activate(rows[it.idx]); break end
+            end
+        end
+    end
+end
+
+youcubeRemoteUI = function()
     local w, h = term.getSize()
     local btns = {}
+    local who = isPocket and ((os.getComputerLabel and os.getComputerLabel()) or ("Pocket " .. os.getComputerID())) or hubName
+    local REDRAW = { timer = true, modem_message = true }
 
-    local function online() return ycStatus and (os.clock() - ycStatus.seen) < YC_STALE_AFTER end
-    local function captured() return ycStatus and ycStatus.captured end
+    local function cur() return selTheater() end
+    local function st() local t = cur(); return t and t.st or nil end
+    local function captured() local s = st(); return s and s.captured end
+    local function announce(open) sendYouCubeRemote("session", { who = who, open = open }, true) end
 
+    local function switchTheater(dir)
+        local list = ycList.paired
+        if #list < 2 then return end
+        local idx = 1
+        for i, t in ipairs(list) do if t.tid == selectedTheater then idx = i end end
+        announce(false)
+        selectedTheater = list[((idx - 1 + dir) % #list) + 1].tid
+        announce(true)
+    end
     local function setCapture(on)
         sendYouCubeRemote("capture_toggle", { captured = on })
-        if ycStatus then ycStatus.captured = on end
+        local s = st(); if s then s.captured = on end
     end
     local function doPause()
-        local payload = nil
-        if ycStatus then payload = { paused = not ycStatus.paused } end
-        sendYouCubeRemote("play_pause", payload)
+        local s = st()
+        sendYouCubeRemote("play_pause", s and { paused = not s.paused } or nil)
     end
     local function setVolume(pct)
         pct = math.max(0, math.min(100, math.floor(pct + 0.5)))
         sendYouCubeRemote("volume_set", { volume = pct })
-        if ycStatus then ycStatus.volume = pct end
+        local s = st(); if s then s.volume = pct end
     end
     local function stepVolume(d)
-        setVolume(((ycStatus and ycStatus.volume) or 100) + d)
+        local s = st()
+        setVolume(((s and s.volume) or 100) + d)
     end
 
-    -- Ask the player to report right away (it also reports every few seconds)
-    sendYouCubeRemote("status_request")
+    announce(true)
+    local sessTimer = os.startTimer(4)
 
     local function draw()
         local pal = palette()
@@ -1680,99 +2229,98 @@ local function youcubeRemoteUI()
             btns[#btns + 1] = { y = y, x1 = x1, x2 = x1 + #label - 1, fn = fn }
             return x1 + #label + 1
         end
-
         setColors(term, pal.fg, pal.bg)
         term.clear()
         setColors(term, pal.headerFg, pal.headerBg)
         term.setCursorPos(1, 1)
         term.write((" YOUCUBE REMOTE" .. string.rep(" ", w)):sub(1, w))
 
-        -- Now playing
-        setColors(term, pal.accentFg, pal.bg)
-        term.setCursorPos(2, 3)
-        term.write(("Now playing:"):sub(1, w - 2))
-        local title = (ycStatus and ycStatus.title ~= "") and ycStatus.title or "-"
-        local avail = w - 2
-        if #title > avail then
-            local maxScroll = #title - avail
-            local pos = marqueePhase % (maxScroll + 4)
-            local startIdx = math.min(maxScroll, pos) + 1
-            title = title:sub(startIdx, startIdx + avail - 1)
-        end
-        setColors(term, pal.fg, pal.bg)
-        term.setCursorPos(2, 4)
-        term.write(title)
-
-        local label, fg
-        if not ycStatus then
-            label, fg = "No player heard yet", colors.red
-        elseif ycStatus.state == "idle" then
-            -- An idle player only listens between songs, so silence is normal
-            label, fg = "Idle (waiting for a song)", colors.lightGray
-        elseif not online() then
-            label, fg = "Player offline (" .. math.floor(os.clock() - ycStatus.seen) .. "s)", colors.red
-        elseif ycStatus.paused then
-            label, fg = "Paused", colors.yellow
-        else
-            label, fg = "Playing", colors.lime
-        end
-        setColors(term, fg, pal.bg)
-        term.setCursorPos(2, 5)
-        term.write(label:sub(1, w - 2))
-
-        -- Transport
-        local paused = ycStatus and ycStatus.paused
-        local x = 2
-        x = btn(7, x, " Restart ", colors.gray, colors.white, function() sendYouCubeRemote("restart") end)
-        x = btn(7, x, paused and " Play " or " Pause ", paused and colors.green or colors.orange, colors.white, doPause)
-        btn(7, x, " Skip ", colors.gray, colors.white, function() sendYouCubeRemote("skip") end)
-
-        -- Volume
-        local vol = (ycStatus and ycStatus.volume) or 100
-        setColors(term, pal.fg, pal.bg)
-        term.setCursorPos(2, 9)
-        term.write(string.format("Volume: %d%%", vol))
-        local barX, barW = 6, math.max(4, w - 12)
-        btn(10, 2, "[-]", colors.gray, colors.white, function() stepVolume(-10) end)
-        setColors(term, colors.white, colors.gray)
-        term.setCursorPos(barX, 10)
-        term.write(string.rep(" ", barW))
-        local filled = math.floor(vol / 100 * barW + 0.5)
-        setColors(term, colors.white, colors.lime)
-        term.setCursorPos(barX, 10)
-        term.write(string.rep(" ", filled))
-        btns[#btns + 1] = { y = 10, x1 = barX, x2 = barX + barW - 1, bar = { x = barX, w = barW } }
-        btn(10, barX + barW + 1, "[+]", colors.gray, colors.white, function() stepVolume(10) end)
-
-        -- Keyboard capture
-        local cap = captured()
-        setColors(term, pal.fg, pal.bg)
-        term.setCursorPos(2, 12)
-        term.write("Send my keyboard:")
-        btn(13, 2, cap and " ON  " or " OFF ", cap and colors.green or colors.red, colors.white, function() setCapture(not cap) end)
-        if cap then
+        local t = cur()
+        if not t then
             setColors(term, colors.yellow, pal.bg)
-            term.setCursorPos(9, 13)
-            term.write("Esc = stop")
+            term.setCursorPos(2, 3); term.write("No theater paired yet.")
+            btn(5, 2, " Open Theaters ", colors.green, colors.white, function() theatersScreen() end)
+        else
+            local multi = #ycList.paired > 1
+            btn(2, 1, " < ", multi and colors.gray or colors.black, colors.white, function() switchTheater(-1) end)
+            btn(2, w - 2, " > ", multi and colors.gray or colors.black, colors.white, function() switchTheater(1) end)
+            setColors(term, t.online and colors.lime or colors.red, pal.bg)
+            term.setCursorPos(5, 2); term.write("\7")
+            setColors(term, pal.fg, pal.bg)
+            term.setCursorPos(7, 2); term.write(t.name:sub(1, w - 12))
+
+            setColors(term, pal.accentFg, pal.bg)
+            term.setCursorPos(2, 4); term.write("Now playing:")
+            local s = t.st or {}
+            local title = (s.title and s.title ~= "") and s.title or "-"
+            local avail = w - 2
+            if #title > avail then
+                local maxScroll = #title - avail
+                local pos = marqueePhase % (maxScroll + 4)
+                local startIdx = math.min(maxScroll, pos) + 1
+                title = title:sub(startIdx, startIdx + avail - 1)
+            end
+            setColors(term, pal.fg, pal.bg)
+            term.setCursorPos(2, 5); term.write(title)
+
+            local label, fg
+            if not t.online then label, fg = "Offline", colors.red
+            elseif s.state ~= "playing" then label, fg = "Idle", colors.lightGray
+            elseif s.paused then label, fg = "Paused", colors.yellow
+            else label, fg = "Playing", colors.lime end
+            setColors(term, fg, pal.bg)
+            term.setCursorPos(2, 6); term.write(label)
+
+            local x = 2
+            x = btn(8, x, " Restart ", colors.gray, colors.white, function() sendYouCubeRemote("restart") end)
+            x = btn(8, x, s.paused and " Play " or " Pause ", s.paused and colors.green or colors.orange, colors.white, doPause)
+            btn(8, x, " Skip ", colors.gray, colors.white, function() sendYouCubeRemote("skip") end)
+
+            local vol = s.volume or 100
+            setColors(term, pal.fg, pal.bg)
+            term.setCursorPos(2, 10); term.write(string.format("Volume: %d%%", vol))
+            local barX, barW = 6, math.max(4, w - 12)
+            btn(11, 2, "[-]", colors.gray, colors.white, function() stepVolume(-10) end)
+            setColors(term, colors.white, colors.gray)
+            term.setCursorPos(barX, 11); term.write(string.rep(" ", barW))
+            setColors(term, colors.white, colors.lime)
+            term.setCursorPos(barX, 11); term.write(string.rep(" ", math.floor(vol / 100 * barW + 0.5)))
+            btns[#btns + 1] = { y = 11, x1 = barX, x2 = barX + barW - 1, bar = { x = barX, w = barW } }
+            btn(11, barX + barW + 1, "[+]", colors.gray, colors.white, function() stepVolume(10) end)
+
+            local cap = s.captured
+            setColors(term, pal.fg, pal.bg)
+            term.setCursorPos(2, 13); term.write("Send my keyboard:")
+            btn(14, 2, cap and " ON  " or " OFF ", cap and colors.green or colors.red, colors.white, function() setCapture(not cap) end)
+            if cap then
+                setColors(term, colors.yellow, pal.bg)
+                term.setCursorPos(9, 14); term.write("Esc = stop")
+            end
         end
 
         setColors(term, pal.footerFg, pal.footerBg)
         term.setCursorPos(1, h); term.write(string.rep(" ", w)); term.setCursorPos(1, h)
-        if cap then
-            term.write((" Keys go to the player"):sub(1, w))
+        if captured() then
+            term.write((" Keys go to the theater"):sub(1, w))
         else
-            term.write((" Space Pause  S Skip  R Restart  Esc Back"):sub(1, w))
+            term.write((" Space Pause S Skip R Restart Tab Next Esc"):sub(1, w))
         end
     end
 
-    local REDRAW = { timer = true, modem_message = true }
     local SPECIAL_KEYS = { enter = true, backspace = true, tab = true, up = true, down = true,
         left = true, right = true, delete = true, home = true, ["end"] = true, pageUp = true, pageDown = true }
+
+    local function leave()
+        announce(false)
+    end
 
     while true do
         draw()
         local ev, p1, p2, p3 = uiPull(REDRAW)
-        if ev == "key" then
+        if ev == "timer" and p1 == sessTimer then
+            announce(true)
+            sessTimer = os.startTimer(4)
+        elseif ev == "key" then
             if captured() then
                 if p1 == keys.escape then
                     setCapture(false)
@@ -1784,10 +2332,13 @@ local function youcubeRemoteUI()
                 end
             else
                 if p1 == keys.escape or p1 == keys.y then
+                    leave()
                     return
                 elseif p1 == keys.space or p1 == keys.p then doPause()
                 elseif p1 == keys.s or p1 == keys.d then sendYouCubeRemote("skip")
                 elseif p1 == keys.r then sendYouCubeRemote("restart")
+                elseif p1 == keys.tab then switchTheater(1)
+                elseif p1 == keys.g then theatersScreen()
                 elseif p1 == keys.minus then stepVolume(-10)
                 elseif p1 == keys.equals then stepVolume(10)
                 elseif p1 == keys.c or p1 == keys.k then setCapture(true)
@@ -1831,6 +2382,7 @@ local function openMoreMenu()
         { label = "Move up", action = "moveup", enabled = has },
         { label = "Move down", action = "movedown", enabled = has },
         { label = "Delete relay", action = "delete", enabled = has },
+        { label = "Theaters (YouCube)", action = "theaters" },
         { label = "YouCube remote", action = "youcube" },
         { label = "Display settings", action = "settings" },
         { label = "Cycle list style", action = "style" },
@@ -1892,7 +2444,8 @@ runAction = function(name)
         if editSettingsForm() then persistSettings() end
     elseif name == "network" then
         if editNetworkForm() then
-            ycStatus = nil
+            ycList = { paired = {}, discovered = {} }
+            selectedTheater = nil
             if isPocket then
                 saveClientState()
                 clientSayHello()
@@ -1904,6 +2457,8 @@ runAction = function(name)
         if isPocket then setToast("Monitor scale is a base setting", "warn") else cycleMonitorScale() end
     elseif name == "youcube" then
         youcubeRemoteUI()
+    elseif name == "theaters" then
+        theatersScreen()
     elseif name == "help" then
         showHelpScreen(term)
     elseif name == "menu" then
@@ -1917,7 +2472,7 @@ local KEY_ACTIONS = {
     [keys.p] = "pause", [keys.d] = "delete", [keys.n] = "pin",
     [keys.comma] = "moveup", [keys.period] = "movedown",
     [keys.v] = "style", [keys.c] = "settings", [keys.w] = "network",
-    [keys.h] = "help", [keys.s] = "scale", [keys.y] = "youcube", [keys.m] = "menu",
+    [keys.h] = "help", [keys.s] = "scale", [keys.y] = "youcube", [keys.g] = "theaters", [keys.m] = "menu",
 }
 
 -- Handles a click inside the relay list area of the main terminal.
@@ -1952,6 +2507,7 @@ local function hostNetwork(msg)
     local c = msg.cmd
     if c == "get" then
         broadcastSync()
+        refreshTheaters(true)
     elseif c == "location" then
         lastPlayerPos = { x = msg.x, y = msg.y, z = msg.z }
         lastGPSFixTime = os.clock()
@@ -1964,16 +2520,29 @@ local function hostNetwork(msg)
             saveConfig()
         end
         broadcastSync()
+        refreshTheaters(true)
     elseif c == "setClientConfig" and msg.clientId and msg.data then
         baseClientSettings[msg.clientId] = msg.data
         saveConfig()
-    elseif c == "youcube_remote" and not msg.fwd then
-        -- Range extender: re-send once so the player hears pockets that are
-        -- out of its range. The player drops duplicates by rid.
-        msg.fwd = true
-        send(msg)
-    elseif c == "youcube_status" then
-        noteYouCubeStatus(msg)
+    elseif c == "yc_beacon" and msg.tid then
+        -- An unpaired theater announcing itself
+        local d = discovered[msg.tid]
+        discovered[msg.tid] = { name = tostring(msg.name or "Theater"):sub(1, 24), nonce = tostring(msg.nonce or ""), seen = os.clock() }
+        if not d then refreshTheaters() end
+    elseif c == "yc_status" then
+        hostYcStatus(msg)
+    elseif c == "yc_relay" then
+        hostYcRelay(msg)
+    elseif c == "yc_pair_result" and msg.tid then
+        hostPairResult(msg)
+    elseif c == "yc_pair_req" and msg.tid and msg.code then
+        hostPairRequest(msg.tid, tostring(msg.code), msg.by)
+    elseif c == "yc_remote" and msg.tid and msg.action then
+        hostYcCommand(msg.tid, msg.action, type(msg.p) == "table" and msg.p or {})
+    elseif c == "yc_unpair" and msg.tid then
+        hostUnpairTheater(msg.tid)
+    elseif c == "yc_rename" and msg.tid then
+        hostRenameTheater(msg.tid, msg.name)
     end
 end
 
@@ -1988,6 +2557,7 @@ local function runHost()
         if ev == "timer" then
             if p1 == clockTimer then
                 evaluateAutomations()
+                theaterTick()
                 clockTimer = os.startTimer(1.0)
             elseif p1 == marqueeTimer then
                 marqueePhase = marqueePhase + 1
@@ -2094,8 +2664,14 @@ local function runClient()
                         saveClientState()
                     elseif msg.cmd == "clientConfig" and msg.clientId == clientId then
                         applyReceivedClientConfig(msg.data)
-                    elseif msg.cmd == "youcube_status" then
-                        noteYouCubeStatus(msg)
+                    elseif msg.cmd == "yc_theaters" then
+                        ycList = { paired = msg.paired or {}, discovered = msg.discovered or {} }
+                    elseif msg.cmd == "yc_event" then
+                        local online = (msg.kind == "online")
+                        setToast(tostring(msg.name) .. (online and " connected" or " disconnected"), online and "ok" or "warn")
+                    elseif msg.cmd == "yc_pair_done" and msg.by == clientId then
+                        if msg.ok then setToast("Paired " .. tostring(msg.name or "theater"), "ok")
+                        else setToast("Pairing failed: " .. tostring(msg.reason or "unknown"), "warn") end
                     end
                 end
                 return true
