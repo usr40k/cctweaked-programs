@@ -2055,6 +2055,18 @@ end
 
 local youcubeRemoteUI   -- defined below
 
+-- Draws the active toast over the footer row. Returns true if it drew one.
+local function footerToast(w, h)
+    local t = currentToast()
+    if not t then return false end
+    local lvl = t.level
+    local bgc = (lvl == "warn") and colors.red or ((lvl == "ok") and colors.green or colors.yellow)
+    setColors(term, (lvl == "warn" or lvl == "ok") and colors.white or colors.black, bgc)
+    term.setCursorPos(1, h)
+    term.write((" " .. t.text .. string.rep(" ", w)):sub(1, w))
+    return true
+end
+
 local function askText(title, label, default)
     local state = { v = default or "" }
     if not runForm(term, title, { { key = "v", label = label, type = "text" } }, state) then return nil end
@@ -2146,6 +2158,7 @@ local function theatersScreen()
         end
         setColors(term, colors.white, colors.gray)
         term.setCursorPos(1, h); term.write((" [Back]  tap a theater" .. string.rep(" ", w)):sub(1, w))
+        footerToast(w, h)
 
         local function activate(row)
             if not row then return end
@@ -2305,6 +2318,7 @@ youcubeRemoteUI = function()
         else
             term.write((" Space Pause S Skip R Restart Tab Next Esc"):sub(1, w))
         end
+        footerToast(w, h)
     end
 
     local SPECIAL_KEYS = { enter = true, backspace = true, tab = true, up = true, down = true,

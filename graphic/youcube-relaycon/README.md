@@ -87,3 +87,29 @@ List of events that are [queued](https://tweaked.cc/module/os.html#v:queueEvent)
 | `youcube:vid_playing`    | `data`    | Called, when Video playback has started         |
 | `youcube:audio_playing`  | `data`    | Called, when Audio playback has started         |
 | `youcube:playing`        |           | Called, when playback has started               |
+
+## Smart-TV mode (relaycon theaters)
+
+YouCube now opens on a home screen (Search / Recent / Settings / Power off) that works by touch on a monitor,
+with the arrow keys + Enter, a real keyboard, or a paired remote. Search has a full on-screen keyboard and
+suggestions from history (URLs and search terms are saved, local files never are).
+
+**Files needed next to `youcube.lua` (in `lib/`):** `ycauth.lua`, `yctheater.lua`, `ycui.lua` (plus the existing libs).
+Update `relay.lua` on the base and pockets too.
+
+**Pairing:** an unpaired theater shows a 6 digit code. In relaycon open `More > Theaters` (or press `G`),
+tap the new theater and type the code. Each theater is a separate entry, so you can pair as many as you like;
+the remote screen has `<` `>` (or Tab) to switch. The hub signs every command, theaters ignore anything unsigned
+or replayed, and relay control from a theater is only accepted from a paired one. This keeps stray computers apart; it is
+not meant to stop someone who can sniff the wireless channel with their own tools.
+
+| Option | Description |
+|--------|-------------|
+| `--theater-name <name>` | Name shown in relaycon |
+| `--rs-side <side\|off>` | Output redstone on this computer's own side |
+| `--rs-when <playing\|idle>` | Signal is ON while playing (default) or while idle |
+| `--pair` | Forget the current hub and show a new pairing code |
+| `--relay-id` / `--relay-side` / `--relay-network` | As before; relay control now works through the paired hub |
+
+Toasts appear when a theater connects/disconnects (in relaycon) and when a remote or the hub connects/disconnects
+(on the theater screen).
