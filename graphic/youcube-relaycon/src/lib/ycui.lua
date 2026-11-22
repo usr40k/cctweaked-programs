@@ -893,6 +893,7 @@ function UI.home(ctx)
 end
 
 UI.RS_SIDES = RS_SIDES
+UI._keyboard_layout = keyboard_layout -- exposed for tests
 UI.suggestions_for = suggestions_for
 UI.is_file_like = is_file_like
 return UI
