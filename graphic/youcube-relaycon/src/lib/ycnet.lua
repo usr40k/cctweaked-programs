@@ -42,7 +42,7 @@ local function validId(id) return type(id) == "string" and id:match("^[%w_%-]+$"
 Net.valid_id = validId
 
 function Net:thumb_url(id, w, h)
-    return string.format("%s/%dx%d:Dordered:Fbimg/%s", self.imgon, w, h, string.format(self.thumb_src, id))
+    return string.format("%s/%dx%d:Dordered:Fbimg:p/%s", self.imgon, w, h, string.format(self.thumb_src, id))
 end
 
 function Net:_start(job)
