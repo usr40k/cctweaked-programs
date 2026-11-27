@@ -199,6 +199,13 @@ function History:set_title(input, title)
     end
 end
 
+function History:title_of(input)
+    for _, e in ipairs(self.items) do
+        if e.url == input and e.title and e.title ~= "" then return e.title end
+    end
+    return input
+end
+
 function History:remove(i)
     if self.items[i] then table.remove(self.items, i); self:save() end
 end

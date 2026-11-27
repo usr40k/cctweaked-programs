@@ -25,7 +25,7 @@ local function is_lib(libs, lib)
     return false
 end
 
-local libs = { "youcubeapi", "numberformatter", "semver", "argparse", "string_pack", "ycauth", "yctheater", "ycui" }
+local libs = { "youcubeapi", "numberformatter", "semver", "argparse", "string_pack", "ycauth", "yctheater", "ycui", "ycbig", "ycnet" }
 local lib_paths = { ".", "./lib", "./apis", "./modules", "/", "/lib", "/apis", "/modules" }
 
 -- LevelOS Support
@@ -589,42 +589,48 @@ local function play(url)
     end
 
     local data
-    local x, y = term.getCursorPos()
+    local Big = libs.ycbig
+    local ld = { title = yc_history and yc_history:title_of(url) or url, status = "Requesting media ...", pct = nil, phase = 0 }
+    local function ld_draw()
+        if args.verbose then return end
+        Big.screen(term, ld)
+    end
+    ld_draw()
 
-    repeat
-        data = youcubeapi:receive()
-        if data.action == "status" then
-            os.queueEvent("youcube:status", data)
-            term.setCursorPos(x, y)
-            term.clearLine()
-            term.write("Status: ")
-            write_colored(data.message, colors.green)
-            term.setTextColor(colors.white)
-        else
-            new_line()
+    local function receive_loop()
+        repeat
+            data = youcubeapi:receive()
+            if data.action == "status" then
+                os.queueEvent("youcube:status", data)
+                ld.status = tostring(data.message or "")
+                ld.pct = Big.parse_pct(ld.status)
+                ld_draw()
+            end
+        until data.action == "media" or data.action == "error"
+    end
+    local function animate()
+        local t = os.startTimer(0.15)
+        while true do
+            local ev, id = os.pullEvent("timer")
+            if id == t then
+                ld.phase = (ld.phase + 0.06) % 1
+                if not ld.pct then ld_draw() end
+                t = os.startTimer(0.15)
+            end
         end
-    until data.action == "media"
+    end
+    parallel.waitForAny(receive_loop, animate)
 
     if data.action == "error" then
         error(data.message)
     end
 
-    term.write("Playing: ")
-    term.setTextColor(colors.lime)
-    print(data.title)
-    term.setTextColor(colors.white)
-
-    if data.like_count then
-        print("Likes: " .. libs.numberformatter.compact(data.like_count))
-    end
-
-    if data.view_count then
-        print("Views: " .. libs.numberformatter.compact(data.view_count))
-    end
-
-    if not args.no_video then
-        -- wait, that the user can see the video info
-        sleep(2)
+    ld.title = tostring(data.title or ld.title)
+    ld.status = "Buffering ..."
+    ld.pct = 0
+    ld_draw()
+    if args.verbose then
+        print("Playing: " .. tostring(data.title))
     end
 
     local video_buffer = libs.youcubeapi.Buffer.new(
@@ -641,6 +647,26 @@ local function play(url)
         ]]
         32
     )
+
+    -- Prefill so playback starts smooth, with a big progress screen.
+    do
+        local want_a = args.no_audio and 0 or math.min(audio_buffer.size, 8)
+        local want_v = args.no_video and 0 or math.min(video_buffer.size, 30)
+        local guard = 0
+        while guard < 300 do
+            guard = guard + 1
+            local a = want_a > 0 and math.min(1, #audio_buffer.buffer / want_a) or 1
+            local v = want_v > 0 and math.min(1, #video_buffer.buffer / want_v) or 1
+            ld.pct = math.floor(((a + v) / 2) * 100)
+            ld.status = "Buffering ..."
+            ld_draw()
+            if a >= 1 and v >= 1 then break end
+            if a < 1 then audio_buffer:fill() end
+            if v < 1 then video_buffer:fill() end
+        end
+        ld.pct, ld.status = 100, "Starting ..."
+        ld_draw()
+    end
 
     if args.verbose then
         term.clear()
