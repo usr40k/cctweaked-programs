@@ -91,6 +91,8 @@ local function pull()
         elseif ev == "key" then return "key", e[2]
         elseif ev == "char" or ev == "paste" then return "char", e[2]
         elseif ev == "timer" then return "timer", e[2]
+        elseif (ev == "http_success" or ev == "http_failure") and UI.net_instance then
+            if UI.net_instance:handle(ev, e[2], e[3]) then return "net" end
         elseif ev == "term_resize" or ev == "monitor_resize" or ev == "ycui:redraw" then return "redraw"
         end
     end
@@ -899,6 +901,8 @@ function UI.home(ctx)
     end
 end
 
+UI._h = { setc = setc, put = put, fill = fill, clip = clip, centered = centered, bar = bar,
+    clock_text = clock_text, pull = pull, hit = hit, ARROWS = ARROWS, THEME = THEME }
 UI.RS_SIDES = RS_SIDES
 UI._keyboard_layout = keyboard_layout -- exposed for tests
 UI.suggestions_for = suggestions_for
