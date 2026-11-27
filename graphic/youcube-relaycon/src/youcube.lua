@@ -652,8 +652,8 @@ local function play(url)
     do
         local want_a = args.no_audio and 0 or math.min(audio_buffer.size, 8)
         local want_v = args.no_video and 0 or math.min(video_buffer.size, 30)
-        local guard = 0
-        while guard < 300 do
+        local guard, stalls, started = 0, 0, os.clock()
+        while guard < 300 and stalls < 3 and os.clock() - started < 10 do
             guard = guard + 1
             local a = want_a > 0 and math.min(1, #audio_buffer.buffer / want_a) or 1
             local v = want_v > 0 and math.min(1, #video_buffer.buffer / want_v) or 1
@@ -661,8 +661,10 @@ local function play(url)
             ld.status = "Buffering ..."
             ld_draw()
             if a >= 1 and v >= 1 then break end
+            local before = #audio_buffer.buffer + #video_buffer.buffer
             if a < 1 then audio_buffer:fill() end
             if v < 1 then video_buffer:fill() end
+            if #audio_buffer.buffer + #video_buffer.buffer == before then stalls = stalls + 1 else stalls = 0 end
         end
         ld.pct, ld.status = 100, "Starting ..."
         ld_draw()
